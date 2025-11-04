@@ -372,14 +372,16 @@ def train_grpo(
             advantages = rewards - rewards.mean(dim=1, keepdim=True)
             advantages = advantages / (rewards.std(dim=1, keepdim=True) + 1e-6)
 
-            # Encode prompts for the current parameters.
-            prompt_embeds = pipeline._encode_prompt(
-                prompt=prompts,
-                device=device,
-                num_images_per_prompt=group_size,
-                do_classifier_free_guidance=False,
-            ).to(dtype=torch.float32)
-            prompt_embeds = prompt_embeds.view(num_branches, -1)
+            # Encode prompts manually (CFG-free) to match sampler behavior.
+            tok = pipeline.tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=pipeline.tokenizer.model_max_length,
+            ).to(device)
+            prompt_embeds = pipeline.text_encoder(tok.input_ids)[0]
+            prompt_embeds = prompt_embeds.repeat_interleave(group_size, dim=0)
             prompt_embeds_model = prompt_embeds.to(unet_dtype)
 
             logp_new_steps = []
@@ -411,7 +413,16 @@ def train_grpo(
 
             with torch.inference_mode():
                 ref_logp_steps = []
-                prompt_embeds_ref = prompt_embeds.to(ref_unet_dtype)
+                # Reference embeddings computed with reference text encoder for stability
+                tok_ref = pipeline.tokenizer(
+                    prompts,
+                    return_tensors="pt",
+                    padding="max_length",
+                    truncation=True,
+                    max_length=pipeline.tokenizer.model_max_length,
+                ).to(device)
+                prompt_embeds_ref = ref_pipeline.text_encoder(tok_ref.input_ids)[0]
+                prompt_embeds_ref = prompt_embeds_ref.repeat_interleave(group_size, dim=0).to(ref_unet_dtype)
                 for step_idx, timestep_value in enumerate(timesteps_window):
                     latents_in = window_inputs[step_idx].reshape(num_branches, *window_inputs.shape[3:])
                     latents_out = window_outputs[step_idx].reshape(num_branches, *window_outputs.shape[3:])

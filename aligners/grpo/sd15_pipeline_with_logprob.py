@@ -123,10 +123,8 @@ def sample_group_with_sde_window(
 
     if guidance_scale != 1.0:
         raise ValueError("Flow-GRPO training requires guidance_scale=1.0 (no CFG)")
-
-    # Align pipeline state with CFG-free sampling expectations.
-    self._guidance_scale = 1.0
-    self.do_classifier_free_guidance = False
+    # Do not mutate pipeline attributes here; simply run with CFG disabled
+    # by not duplicating unconditional embeddings and never applying CFG math.
 
     batch_size = len(prompts)
     if batch_size == 0:
@@ -139,14 +137,17 @@ def sample_group_with_sde_window(
 
     main_generator, generator_list = _prepare_generator(generator, device)
 
-    # Encode prompts once (CFG disabled, so only positive prompts).
-    prompt_embeds = self._encode_prompt(
-        prompt=list(prompts),
-        device=device,
-        num_images_per_prompt=group_size,
-        do_classifier_free_guidance=False,
-    )
-    prompt_embeds = prompt_embeds.to(dtype=dtype)
+    # Encode prompts manually to avoid CFG branches in older diffusers versions.
+    tok = self.tokenizer(
+        list(prompts),
+        return_tensors="pt",
+        padding="max_length",
+        truncation=True,
+        max_length=self.tokenizer.model_max_length,
+    ).to(device)
+    prompt_embeds = self.text_encoder(tok.input_ids)[0]
+    # Repeat for K branches per prompt
+    prompt_embeds = prompt_embeds.repeat_interleave(group_size, dim=0).to(dtype=dtype)
 
     # Prepare latent noise.
     height = height or self.unet.config.sample_size * self.vae_scale_factor
@@ -213,9 +214,7 @@ def sample_group_with_sde_window(
 
     # Decode latents to images in [0, 1].
     latents = latents / self.vae.config.scaling_factor
-    latents = latents.to(dtype=self.vae.dtype)
-    images = self.decode_latents(latents)
-    images = images.clamp(0.0, 1.0)
+    images = self.decode_latents(latents.to(self.vae.dtype))
 
     num_branches = batch_size * group_size
     if traj_logprobs:
