@@ -38,7 +38,11 @@ def sde_step_with_logprob(
     generator: Optional[torch.Generator] = None,
     prev_sample: Optional[TensorLike] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Perform one stochastic update and return log-prob components."""
+    """Perform one stochastic update matching DPMSolver++ SDE and return log-prob.
+    
+    This implementation exactly mirrors the DPMSolver++ SDE update formula from diffusers
+    to ensure correct transitions and log-probability computation.
+    """
 
     model_output = model_output.to(dtype=torch.float32)
     sample = sample.to(dtype=torch.float32)
@@ -48,31 +52,58 @@ def sde_step_with_logprob(
     if timestep_tensor.numel() != sample.shape[0]:
         timestep_tensor = timestep_tensor.expand(sample.shape[0])
 
+    # Get sigma values at current and next timesteps
     index_list = [scheduler.index_for_timestep(t.item()) for t in timestep_tensor]
     indices = torch.tensor(index_list, device=sample.device, dtype=torch.int64)
     next_indices = torch.clamp(indices + 1, max=len(scheduler.sigmas) - 1)
 
-    sigma_t = _gather_sigmas(scheduler, indices, sample)
-    sigma_next = _gather_sigmas(scheduler, next_indices, sample)
+    sigma_s = _gather_sigmas(scheduler, indices, sample)
+    sigma_t = _gather_sigmas(scheduler, next_indices, sample)
 
-    alpha_t_sq = 1.0 / (1.0 + sigma_t**2)
-    alpha_next_sq = 1.0 / (1.0 + sigma_next**2)
-    sqrt_alpha_t = torch.sqrt(alpha_t_sq)
-    sqrt_alpha_next = torch.sqrt(alpha_next_sq)
-    sqrt_one_minus_alpha_next = torch.sqrt(torch.clamp(1.0 - alpha_next_sq, min=1e-12))
+    # Convert sigma to (alpha, sigma) parameterization
+    alpha_s = 1.0 / torch.sqrt(1.0 + sigma_s**2)
+    alpha_t = 1.0 / torch.sqrt(1.0 + sigma_t**2)
+    
+    # Convert model output (epsilon) to x0 prediction (required for DPMSolver++)
+    # This matches scheduler.convert_model_output() behavior
+    if scheduler.config.prediction_type == "epsilon":
+        x0_pred = (sample - sigma_s * model_output) / alpha_s
+    elif scheduler.config.prediction_type == "sample":
+        x0_pred = model_output
+    elif scheduler.config.prediction_type == "v_prediction":
+        x0_pred = alpha_s * sample - sigma_s * model_output
+    else:
+        raise ValueError(f"Unsupported prediction_type: {scheduler.config.prediction_type}")
+    
+    # Compute lambda values: lambda = log(alpha) - log(sigma)
+    lambda_s = torch.log(alpha_s) - torch.log(sigma_s)
+    lambda_t = torch.log(alpha_t) - torch.log(sigma_t)
+    h = lambda_t - lambda_s
 
-    # Predict x0 (clean sample) using the epsilon (noise) prediction model.
-    x0_pred = (sample - sigma_t * model_output) / sqrt_alpha_t
-    mean = sqrt_alpha_next * x0_pred
+    # DPMSolver++ SDE formula (first-order):
+    # x_t = (sigma_t / sigma_s * exp(-h)) * sample
+    #       + (alpha_t * (1 - exp(-2h))) * x0_pred
+    #       + sigma_t * sqrt(1 - exp(-2h)) * noise
+    
+    exp_neg_h = torch.exp(-h)
+    exp_neg_2h = torch.exp(-2.0 * h)
+    
+    coeff_sample = (sigma_t / sigma_s) * exp_neg_h
+    coeff_x0 = alpha_t * (1.0 - exp_neg_2h)
+    std = sigma_t * torch.sqrt(torch.clamp(1.0 - exp_neg_2h, min=1e-12))
+    
+    # Compute mean of the transition
+    mean = coeff_sample * sample + coeff_x0 * x0_pred
 
     if noise_level == 0.0:
+        # Deterministic ODE update
         if prev_sample is None:
             prev_sample = mean
         log_prob = torch.zeros(sample.shape[0], device=sample.device, dtype=torch.float32)
-        std = torch.zeros_like(sigma_next)
         return prev_sample, log_prob, mean, std
 
-    std = noise_level * sqrt_one_minus_alpha_next
+    # Scale std by noise_level (SDE strength)
+    std = std * noise_level
 
     if prev_sample is None:
         noise = randn_tensor(
@@ -85,16 +116,22 @@ def sde_step_with_logprob(
     else:
         noise = (prev_sample - mean) / torch.clamp(std, min=1e-12)
 
+    # Compute log-probability of the Gaussian transition
+    # Use mean() like SD3 implementation to get per-sample scalar log-prob
     var = torch.clamp(std**2, min=1e-12)
     diff = prev_sample - mean
-
-    diff_sq_over_var = (diff**2 / var).flatten(start_dim=1).sum(dim=1)
-    log_det_var = torch.log(var).flatten(start_dim=1).sum(dim=1)
-
-    num_dims = diff[0].numel()
-    log_prob = -0.5 * (diff_sq_over_var + log_det_var + num_dims * math.log(2 * math.pi))
+    
+    log_prob = (
+        -((diff ** 2) / (2 * var))
+        - torch.log(std)
+        - 0.5 * math.log(2 * math.pi)
+    )
+    
+    # Average over spatial dimensions to get per-sample log-prob [B]
+    log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
 
     return prev_sample, log_prob, mean, std
+
 
 
 __all__ = ["sde_step_with_logprob"]

@@ -36,8 +36,9 @@ import lib.reward_func.prompts
 import lib.reward_func.rewards
 from lib.diffusion.sample_trajectory import sample_trajectory
 from lib.diffusion.inference_step import inference_step, predict_clean, get_alpha_prod_t
-from aligners.grpo.sd15_pipeline_with_logprob import sample_group_with_sde_window
+from aligners.grpo.sd15_pipeline_with_logprob_fast import sample_group_with_sde_window
 from aligners.grpo.sd15_sde_with_logprob import sde_step_with_logprob
+from aligners.grpo.sd15_pipeline_with_logprob_slow import pipeline_with_logprob_slow
 
 
 from absl import app
@@ -53,6 +54,7 @@ flags.DEFINE_string("exp_name", "", "Experiment name.")
 flags.DEFINE_integer("seed", 0, "Seed.")
 flags.DEFINE_enum("mode", "nablagfn", ["nablagfn", "grpo"], "Training mode (nablagfn or grpo).")
 flags.DEFINE_bool("sde_sanity", False, "Run a zero-noise SDE window sanity check and exit.")
+flags.DEFINE_float("sde_sanity_cfg", None, "Override guidance_scale for sanity check. If None, uses training value (1.0 for GRPO).")
 
 def unwrap_model(model):
     model = model.module if isinstance(model, DDP) else model
@@ -506,26 +508,51 @@ def run_sde_sanity(config, pipeline, device, logger):
     prompts = list(prompts)
     prompt_metadata = list(prompt_metadata)
 
+    # Temporarily disable LoRA adapters for a clean baseline image.
+    lora_restore = None
+    try:
+        if hasattr(pipeline.unet, "disable_adapters"):
+            pipeline.unet.disable_adapters()
+            lora_restore = True
+    except Exception:
+        pass
+
     generator = torch.Generator(device=device).manual_seed(config.seed)
-    imgs, _, timesteps_window, _, _ = pipeline.sample_group_with_sde_window(
+    
+    # Allow overriding guidance_scale for sanity check visualization
+    guidance_scale = FLAGS.sde_sanity_cfg if FLAGS.sde_sanity_cfg is not None else 1.0
+    if FLAGS.sde_sanity_cfg is not None:
+        logger.info(f"Sanity check: Using CFG guidance_scale={guidance_scale} (override)")
+    
+    # Use sample_group_with_sde_window with noise_level=0.0 (sanity mode)
+    # This now supports CFG when guidance_scale != 1.0
+    imgs, _, timesteps_window, _, _ = pipeline.pipeline_with_logprob_slow(
         prompts,
         group_size,
         config.sample.sde_window_size,
         tuple(config.sample.sde_window_range),
         num_inference_steps=config.sampling.num_steps,
-        guidance_scale=1.0,
+        guidance_scale=guidance_scale,
         generator=generator,
         same_latent=config.sample.same_latent,
-        noise_level=0.0,
+        noise_level=0.0,  # Sanity mode enables CFG support
     )
-
+    
+    # Restore LoRA after sampling
+    try:
+        if lora_restore and hasattr(pipeline.unet, "enable_adapters"):
+            pipeline.unet.enable_adapters()
+    except Exception:
+        pass
+    
     first_image = imgs[0, 0].clamp(0, 1).permute(1, 2, 0).cpu().numpy()
     first_image = (first_image * 255).astype("uint8")
     rank = dist.get_rank() if dist.is_initialized() else 0
     os.makedirs(config.saving.output_dir, exist_ok=True)
-    output_path = os.path.join(config.saving.output_dir, f"sde_sanity_rank{rank}.png")
+    cfg_suffix = f"_cfg{guidance_scale}" if FLAGS.sde_sanity_cfg is not None else ""
+    output_path = os.path.join(config.saving.output_dir, f"sde_sanity_rank{rank}{cfg_suffix}.png")
     Image.fromarray(first_image).save(output_path)
-    logger.info(f"Saved SDE sanity image to {output_path}; window timesteps {timesteps_window}")
+    logger.info(f"Saved SDE sanity image to {output_path}; guidance_scale={guidance_scale}, window timesteps {timesteps_window}")
 
 
 def train():
@@ -735,29 +762,41 @@ def train():
             samples = new_samples
 
             if epoch >= 0:
-                # this is a hack to force wandb to log the images as JPEGs instead of PNGs
-                with tempfile.TemporaryDirectory() as tmpdir:
+                # Save images to output directory
+                if is_local_main_process:
+                    images_dir = os.path.join(config.saving.output_dir, f"images_epoch{epoch}_step{global_step}")
+                    os.makedirs(images_dir, exist_ok=True)
                     for i, image in enumerate(images):
                         pil = Image.fromarray(
                             (image.cpu().float().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
                         )
                         pil = pil.resize((256, 256))
-                        pil.save(os.path.join(tmpdir, f"{i}.jpg"))
-                    if config.logging.use_wandb and is_local_main_process:
-                        wandb.log(
-                            {
-                                "images": [
-                                    wandb.Image(
-                                        os.path.join(tmpdir, f"{i}.jpg"),
-                                        caption=f"{prompt} | {reward:.2f}",
-                                    )
-                                    for i, (prompt, reward) in enumerate(
-                                        zip(prompts, rewards)
-                                    )
-                                ],
-                            },
-                            step=global_step,
-                        )
+                        pil.save(os.path.join(images_dir, f"{i}.jpg"))
+                
+                # this is a hack to force wandb to log the images as JPEGs instead of PNGs
+                if config.logging.use_wandb:
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        for i, image in enumerate(images):
+                            pil = Image.fromarray(
+                                (image.cpu().float().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+                            )
+                            pil = pil.resize((256, 256))
+                            pil.save(os.path.join(tmpdir, f"{i}.jpg"))
+                        if is_local_main_process:
+                            wandb.log(
+                                {
+                                    "images": [
+                                        wandb.Image(
+                                            os.path.join(tmpdir, f"{i}.jpg"),
+                                            caption=f"{prompt} | {reward:.2f}",
+                                        )
+                                        for i, (prompt, reward) in enumerate(
+                                            zip(prompts, rewards)
+                                        )
+                                    ],
+                                },
+                                step=global_step,
+                            )
 
                 rewards = torch.zeros(world_size * len(samples["rewards"]),
                             dtype=samples["rewards"].dtype, device=device)
