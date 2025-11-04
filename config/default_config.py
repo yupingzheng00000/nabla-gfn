@@ -49,6 +49,20 @@ def get_default_configs():
     sampling.scheduler = 'DDPM'
 
 
+    grpo = config.grpo = config_dict.ConfigDict()
+    grpo.enabled = False
+    grpo.group_size = 4
+    grpo.beta = 0.05
+    grpo.clip_range = 0.2
+
+
+    sample = config.sample = config_dict.ConfigDict()
+    sample.sde_window_size = 2
+    sample.sde_window_range = (0.6, 1.0)
+    sample.sde_noise_level = 0.8
+    sample.same_latent = True
+
+
     pretrained = config.pretrained = config_dict.ConfigDict()
     pretrained.model = "runwayml/stable-diffusion-v1-5"
     pretrained.revision = "main"

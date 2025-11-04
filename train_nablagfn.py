@@ -36,6 +36,8 @@ import lib.reward_func.prompts
 import lib.reward_func.rewards
 from lib.diffusion.sample_trajectory import sample_trajectory
 from lib.diffusion.inference_step import inference_step, predict_clean, get_alpha_prod_t
+from aligners.grpo.sd15_pipeline_with_logprob import sample_group_with_sde_window
+from aligners.grpo.sd15_sde_with_logprob import sde_step_with_logprob
 
 
 from absl import app
@@ -49,6 +51,8 @@ config_flags.DEFINE_config_file(
   "config", None, "Training configuration.", lock_config=False)
 flags.DEFINE_string("exp_name", "", "Experiment name.")
 flags.DEFINE_integer("seed", 0, "Seed.")
+flags.DEFINE_enum("mode", "nablagfn", ["nablagfn", "grpo"], "Training mode (nablagfn or grpo).")
+flags.DEFINE_bool("sde_sanity", False, "Run a zero-noise SDE window sanity check and exit.")
 
 def unwrap_model(model):
     model = model.module if isinstance(model, DDP) else model
@@ -79,6 +83,8 @@ def setup(local_rank, is_local_main_process):
     else:
         config.seed = 0
 
+    if FLAGS.mode == "grpo":
+        config.model.no_flow = True
     if config.model.no_flow:
         config.model.reverse_loss_scale = 0.0
 
@@ -113,16 +119,25 @@ def setup(local_rank, is_local_main_process):
     scheduler_config = {}
 
     scheduler_config.update(pipeline.scheduler.config)
-    if config.sampling.scheduler == 'DPM-solver':
+    num_inference_steps = config.sampling.num_steps
+    if FLAGS.mode == "grpo":
+        if is_local_main_process:
+            logger.info("GRPO mode: using DPMSolverSinglestepScheduler (SDE)")
+        pipeline.scheduler = DPMSolverSinglestepScheduler.from_config(scheduler_config)
+        pipeline.scheduler.config.algorithm_type = "sde-dpmsolver++"
+        pipeline.scheduler.config.final_sigmas_type = 'sigma_min'
+        config.sampling.guidance_scale = 1.0
+        pipeline.scheduler.set_timesteps(num_inference_steps, device=device)
+    elif config.sampling.scheduler == 'DPM-solver':
         if is_local_main_process:
             logger.info("Using SDE DPM-solver (1st order)")
         pipeline.scheduler = DPMSolverSinglestepScheduler.from_config(scheduler_config)
         pipeline.scheduler.config.algorithm_type = "sde-dpmsolver++"  # Switch to SDE mode
-        ### Essential; otherwise the score function at the final step is of infinite magnitude
         pipeline.scheduler.config.final_sigmas_type = 'sigma_min'
         pipeline.scheduler.set_timesteps(num_inference_steps, device=device)
     else:
         pipeline.scheduler = DDIMScheduler.from_config(scheduler_config)
+    pipeline.sample_group_with_sde_window = sample_group_with_sde_window.__get__(pipeline, type(pipeline))
     pipeline.vae.requires_grad_(False)
     pipeline.text_encoder.requires_grad_(False)
     pipeline.vae.to(device, dtype=weight_dtype)
@@ -219,6 +234,7 @@ def setup(local_rank, is_local_main_process):
 
     unet.to(device)
     unet = DDP(unet, device_ids=[local_rank])
+    pipeline.unet = unet.module
     if not config.model.no_flow:
         res_logflowscore_model.to(device)
         res_logflowscore_model = DDP(res_logflowscore_model, device_ids=[local_rank])
@@ -245,6 +261,262 @@ def setup(local_rank, is_local_main_process):
     return config, pipeline, optimizer, unet, res_logflowscore_model, sample_neg_prompt_embeds, train_neg_prompt_embeds, logger, scaler
 
 
+def train_grpo(
+    local_rank,
+    global_rank,
+    world_size,
+    config,
+    pipeline,
+    optimizer,
+    unet,
+    logger,
+    scaler,
+    device,
+    is_local_main_process,
+):
+    pipeline.unet.eval()
+    unet.train()
+
+    prompt_fn = getattr(lib.reward_func.prompts, config.experiment.prompt_fn)
+    reward_ctor = getattr(lib.reward_func.rewards, config.experiment.reward_fn)
+    reward_fn = reward_ctor(torch.float32, device)
+
+    group_size = config.grpo.group_size
+    clip_range = float(config.grpo.clip_range)
+    beta = float(config.grpo.beta)
+    grad_accum = max(1, int(config.training.gradient_accumulation_steps))
+    batch_size = int(config.sampling.batch_size)
+    num_batches = int(config.sampling.num_batches_per_epoch)
+    num_epochs = int(config.training.num_epochs)
+    noise_level = float(config.sample.sde_noise_level)
+    window_size = int(config.sample.sde_window_size)
+    window_range = tuple(config.sample.sde_window_range)
+    same_latent = bool(config.sample.same_latent)
+
+    unet_module = unet.module if hasattr(unet, "module") else unet
+    unet_dtype = next(unet_module.parameters()).dtype
+
+    amp_dtype = None
+    if config.training.mixed_precision == "fp16":
+        amp_dtype = torch.float16
+    elif config.training.mixed_precision == "bf16":
+        amp_dtype = torch.bfloat16
+    autocast_ctx = torch.cuda.amp.autocast if amp_dtype is not None else contextlib.nullcontext
+    autocast_kwargs = {"dtype": amp_dtype} if amp_dtype is not None else {}
+
+    # Frozen reference pipeline for KL regularisation.
+    ref_pipeline = StableDiffusionPipeline.from_pretrained(
+        config.pretrained.model,
+        revision=config.pretrained.revision,
+        torch_dtype=amp_dtype or torch.float32,
+    ).to(device)
+    ref_pipeline.scheduler = DPMSolverSinglestepScheduler.from_config(pipeline.scheduler.config)
+    ref_pipeline.scheduler.config.algorithm_type = "sde-dpmsolver++"
+    ref_pipeline.scheduler.config.final_sigmas_type = 'sigma_min'
+    ref_pipeline.scheduler.set_timesteps(config.sampling.num_steps, device=device)
+    ref_pipeline.sample_group_with_sde_window = sample_group_with_sde_window.__get__(ref_pipeline, type(ref_pipeline))
+    ref_pipeline.unet.requires_grad_(False)
+    ref_pipeline.text_encoder.requires_grad_(False)
+    ref_pipeline.vae.requires_grad_(False)
+    ref_unet = ref_pipeline.unet
+    ref_unet_dtype = next(ref_unet.parameters()).dtype
+
+    generator = torch.Generator(device=device)
+    optimizer.zero_grad(set_to_none=True)
+
+    global_step = 0
+    for epoch in range(num_epochs):
+        if is_local_main_process:
+            logger.info(f"[GRPO] Epoch {epoch}")
+
+        for batch_idx in range(num_batches):
+            seed = config.seed + epoch * num_batches + batch_idx + global_rank
+            generator.manual_seed(seed)
+
+            prompt_batch = [prompt_fn(**config.experiment.prompt_fn_kwargs) for _ in range(batch_size)]
+            prompts, prompt_metadata = zip(*prompt_batch)
+            prompts = list(prompts)
+            prompt_metadata = list(prompt_metadata)
+
+            unet.eval()
+            with torch.inference_mode():
+                imgs, traj_logprobs, timesteps_window, logp_sum_old, window_state = pipeline.sample_group_with_sde_window(
+                    prompts,
+                    group_size,
+                    window_size,
+                    window_range,
+                    num_inference_steps=config.sampling.num_steps,
+                    guidance_scale=1.0,
+                    generator=generator,
+                    same_latent=same_latent,
+                    noise_level=noise_level,
+                )
+            unet.train()
+
+            num_branches = batch_size * group_size
+            imgs = imgs.to(device=device, dtype=torch.float32)
+            traj_logprobs = traj_logprobs.to(device=device, dtype=torch.float32)
+            logp_sum_old = logp_sum_old.to(device=device, dtype=torch.float32)
+            window_inputs = window_state["inputs"].to(device=device, dtype=torch.float32)
+            window_outputs = window_state["outputs"].to(device=device, dtype=torch.float32)
+
+            # Compute rewards.
+            images_flat = imgs.view(num_branches, *imgs.shape[2:])
+            prompt_repeat = [prompt for prompt in prompts for _ in range(group_size)]
+            metadata_repeat = [meta for meta in prompt_metadata for _ in range(group_size)]
+            rewards_flat, _ = reward_fn(images_flat, prompt_repeat, metadata_repeat)
+            rewards = rewards_flat.to(device=device, dtype=torch.float32).view(batch_size, group_size)
+            reward_mean = rewards.mean().item()
+            reward_std = rewards.std(unbiased=False).item()
+
+            advantages = rewards - rewards.mean(dim=1, keepdim=True)
+            advantages = advantages / (rewards.std(dim=1, keepdim=True) + 1e-6)
+
+            # Encode prompts for the current parameters.
+            prompt_embeds = pipeline._encode_prompt(
+                prompt=prompts,
+                device=device,
+                num_images_per_prompt=group_size,
+                do_classifier_free_guidance=False,
+            ).to(dtype=torch.float32)
+            prompt_embeds = prompt_embeds.view(num_branches, -1)
+            prompt_embeds_model = prompt_embeds.to(unet_dtype)
+
+            logp_new_steps = []
+            with (autocast_ctx(**autocast_kwargs) if autocast_kwargs else autocast_ctx()):
+                for step_idx, timestep_value in enumerate(timesteps_window):
+                    latents_in = window_inputs[step_idx].reshape(num_branches, *window_inputs.shape[3:])
+                    latents_out = window_outputs[step_idx].reshape(num_branches, *window_outputs.shape[3:])
+                    timestep_tensor = torch.full((num_branches,), timestep_value, device=device, dtype=torch.float32)
+
+                    latent_model_input = pipeline.scheduler.scale_model_input(latents_in.to(unet_dtype), timestep_tensor)
+                    noise_pred = unet(
+                        latent_model_input,
+                        timestep_tensor,
+                        encoder_hidden_states=prompt_embeds_model,
+                        return_dict=False,
+                    )[0]
+                    _, log_prob_new, _, _ = sde_step_with_logprob(
+                        pipeline.scheduler,
+                        noise_pred,
+                        timestep_tensor,
+                        latents_in,
+                        noise_level=noise_level,
+                        prev_sample=latents_out,
+                    )
+                    logp_new_steps.append(log_prob_new.to(torch.float32))
+
+            logp_new = torch.stack(logp_new_steps, dim=1).view(batch_size, group_size, -1)
+            logp_sum_new = logp_new.sum(dim=-1)
+
+            with torch.inference_mode():
+                ref_logp_steps = []
+                prompt_embeds_ref = prompt_embeds.to(ref_unet_dtype)
+                for step_idx, timestep_value in enumerate(timesteps_window):
+                    latents_in = window_inputs[step_idx].reshape(num_branches, *window_inputs.shape[3:])
+                    latents_out = window_outputs[step_idx].reshape(num_branches, *window_outputs.shape[3:])
+                    timestep_tensor = torch.full((num_branches,), timestep_value, device=device, dtype=torch.float32)
+                    latent_model_input = ref_pipeline.scheduler.scale_model_input(latents_in.to(ref_unet_dtype), timestep_tensor)
+                    noise_pred_ref = ref_unet(
+                        latent_model_input,
+                        timestep_tensor,
+                        encoder_hidden_states=prompt_embeds_ref,
+                        return_dict=False,
+                    )[0]
+                    _, log_prob_ref, _, _ = sde_step_with_logprob(
+                        ref_pipeline.scheduler,
+                        noise_pred_ref,
+                        timestep_tensor,
+                        latents_in,
+                        noise_level=noise_level,
+                        prev_sample=latents_out,
+                    )
+                    ref_logp_steps.append(log_prob_ref.to(torch.float32))
+                logp_ref = torch.stack(ref_logp_steps, dim=1).view(batch_size, group_size, -1).sum(dim=-1)
+
+            delta_logp = logp_sum_new - logp_sum_old
+            if clip_range > 0.0:
+                delta_clamped = delta_logp.clamp(min=-clip_range, max=clip_range)
+            else:
+                delta_clamped = delta_logp
+            logp_clipped = logp_sum_old + delta_clamped
+
+            loss_policy = -(advantages * logp_clipped).mean()
+            loss_kl = ((logp_sum_new.detach() - logp_ref) ** 2).mean()
+            loss = loss_policy + beta * loss_kl
+            loss = loss / grad_accum
+
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+            if (batch_idx + 1) % grad_accum == 0:
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(unet.parameters(), config.training.max_grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(unet.parameters(), config.training.max_grad_norm)
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+
+            ratio = torch.exp(delta_logp.detach()).mean().item()
+            if is_local_main_process and abs(ratio - 1.0) > 0.02:
+                logger.warning(f"[GRPO] ratio deviates from on-policy target: {ratio:.3f}")
+
+            if is_local_main_process:
+                logger.debug(f"[GRPO] window timesteps: {timesteps_window}")
+                logger.info(
+                    f"[GRPO] epoch {epoch} batch {batch_idx} | loss={loss_policy.item():.4f} "
+                    f"kl={loss_kl.item():.4f} reward_mean={reward_mean:.3f} ratio={ratio:.3f}"
+                )
+                if config.logging.use_wandb:
+                    wandb.log(
+                        {
+                            "loss/policy": loss_policy.item(),
+                            "loss/kl": loss_kl.item(),
+                            "reward/mean": reward_mean,
+                            "reward/std": reward_std,
+                            "ratio/mean": ratio,
+                        },
+                        step=global_step,
+                    )
+
+def run_sde_sanity(config, pipeline, device, logger):
+    prompt_fn = getattr(lib.reward_func.prompts, config.experiment.prompt_fn)
+    batch_size = int(config.sampling.batch_size)
+    group_size = int(config.grpo.group_size) if hasattr(config, "grpo") else 1
+
+    prompt_batch = [prompt_fn(**config.experiment.prompt_fn_kwargs) for _ in range(batch_size)]
+    prompts, prompt_metadata = zip(*prompt_batch)
+    prompts = list(prompts)
+    prompt_metadata = list(prompt_metadata)
+
+    generator = torch.Generator(device=device).manual_seed(config.seed)
+    imgs, _, timesteps_window, _, _ = pipeline.sample_group_with_sde_window(
+        prompts,
+        group_size,
+        config.sample.sde_window_size,
+        tuple(config.sample.sde_window_range),
+        num_inference_steps=config.sampling.num_steps,
+        guidance_scale=1.0,
+        generator=generator,
+        same_latent=config.sample.same_latent,
+        noise_level=0.0,
+    )
+
+    first_image = imgs[0, 0].clamp(0, 1).permute(1, 2, 0).cpu().numpy()
+    first_image = (first_image * 255).astype("uint8")
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    os.makedirs(config.saving.output_dir, exist_ok=True)
+    output_path = os.path.join(config.saving.output_dir, f"sde_sanity_rank{rank}.png")
+    Image.fromarray(first_image).save(output_path)
+    logger.info(f"Saved SDE sanity image to {output_path}; window timesteps {timesteps_window}")
+
+
 def train():
 
     local_rank, global_rank, world_size = init_distributed_singlenode(timeout=36000)
@@ -254,6 +526,28 @@ def train():
 
     config, pipeline, optimizer, unet, res_logflowscore_model, sample_neg_prompt_embeds, train_neg_prompt_embeds, logger, scaler = setup(local_rank, is_local_main_process)
 
+    device = torch.device(local_rank)
+
+    if FLAGS.sde_sanity:
+        run_sde_sanity(config, pipeline, device, logger)
+        return
+
+    if FLAGS.mode == "grpo":
+        train_grpo(
+            local_rank,
+            global_rank,
+            world_size,
+            config,
+            pipeline,
+            optimizer,
+            unet,
+            logger,
+            scaler,
+            device,
+            is_local_main_process,
+        )
+        return
+
     def decode(latents, clamp=True):
         image = pipeline.vae.decode(
             latents / pipeline.vae.config.scaling_factor, return_dict=False
@@ -262,8 +556,6 @@ def train():
         if clamp:
             image = image.clamp(0, 1)
         return image
-
-    device = torch.device(local_rank)
 
     # prepare prompt and reward fn
     prompt_fn = getattr(lib.reward_func.prompts, config.experiment.prompt_fn)
