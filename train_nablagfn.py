@@ -291,6 +291,7 @@ def train_grpo(
 
     group_size = config.grpo.group_size
     clip_range = float(config.grpo.clip_range)
+    adv_clip_max = float(getattr(config.grpo, "adv_clip_max", 0.0) or 0.0)
     beta = float(config.grpo.beta)
     grad_accum = max(1, int(config.training.gradient_accumulation_steps))
     batch_size = int(config.sampling.batch_size)
@@ -318,6 +319,10 @@ def train_grpo(
         logger.info(f"  Reward scale: {reward_scale:.2e}")
         logger.info(f"  KL beta: {beta}")
         logger.info(f"  PPO clip range: {clip_range}")
+        if adv_clip_max > 0:
+            logger.info(f"  Advantage clip max: {adv_clip_max}")
+        else:
+            logger.info("  Advantage clip max: disabled")
         logger.info(f"  Group size: {group_size}")
         logger.info(f"  Batch size: {batch_size}")
         logger.info(f"  Gradient accumulation: {grad_accum}")
@@ -439,6 +444,8 @@ def train_grpo(
             advantages = rewards - rewards.mean(dim=1, keepdim=True)
             advantages = advantages / (rewards.std(dim=1, keepdim=True) + 1e-6)
             advantages = advantages * reward_scale  # Amplify the training signal
+            if adv_clip_max > 0:
+                advantages = advantages.clamp_(-adv_clip_max, adv_clip_max)
 
             # Encode prompts manually (CFG-free) to match sampler behavior.
             tok = pipeline.tokenizer(
@@ -595,13 +602,15 @@ def train_grpo(
 
             # Use subset-aligned old log-prob sum for a fair comparison
             delta_logp = logp_sum_new - log_probs_sum_old_subset
+            # Standard PPO clipped-ratio objective
+            ratio = torch.exp(delta_logp)
+            unclipped_loss = -advantages * ratio
             if clip_range > 0.0:
-                delta_clamped = delta_logp.clamp(min=-clip_range, max=clip_range)
+                clipped_ratio = torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range)
+                clipped_loss = -advantages * clipped_ratio
+                loss_policy = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
             else:
-                delta_clamped = delta_logp
-            logp_clipped = log_probs_sum_old + delta_clamped
-
-            loss_policy = -(advantages * logp_clipped).mean()
+                loss_policy = torch.mean(unclipped_loss)
             loss_kl = ((logp_sum_new.detach() - logp_ref) ** 2).mean()
             
             # Add UNet regularization to loss
@@ -642,7 +651,7 @@ def train_grpo(
             # Compute monitoring metrics
             ratio = torch.exp(delta_logp.detach()).mean().item()
             kl_div = ((logp_sum_new.detach() - logp_ref) ** 2).mean().item()
-            clip_fraction = ((torch.abs(delta_logp) > clip_range).float().mean().item() if clip_range > 0 else 0.0)
+            clip_fraction = ((torch.abs(torch.exp(delta_logp.detach()) - 1.0) > clip_range).float().mean().item() if clip_range > 0 else 0.0)
             advantage_mean = advantages.mean().item()
             advantage_std = advantages.std().item()
             
@@ -685,6 +694,8 @@ def train_grpo(
                         "batch_idx": batch_idx,
                         "global_step": global_step,
                     }
+                    if adv_clip_max > 0:
+                        log_dict["advantage/clip_max"] = adv_clip_max
                     if config.model.unet_reg_scale > 0:
                         log_dict["loss/unet_reg"] = unet_reg_mean
                     wandb.log(log_dict, step=global_step)
@@ -732,6 +743,36 @@ def train_grpo(
             # Clear latents dict to free CPU memory for next batch
             all_latents.clear()
             torch.cuda.empty_cache()
+        
+        # Save checkpoint every save_freq epochs (default: 5)
+        if epoch % config.logging.save_freq == 0 or epoch == num_epochs - 1:
+            if is_local_main_process:
+                save_path = os.path.join(config.saving.output_dir, f"checkpoint_epoch{epoch}")
+                os.makedirs(save_path, exist_ok=True)
+                
+                # Save LoRA weights (GRPO uses "pf" adapter, not "default")
+                unwrapped_unet = unwrap_model(unet)
+                unet_lora_state_dict = convert_state_dict_to_diffusers(
+                    get_peft_model_state_dict(unwrapped_unet, adapter_name="pf")
+                )
+                StableDiffusionPipeline.save_lora_weights(
+                    save_directory=save_path,
+                    unet_lora_layers=unet_lora_state_dict,
+                    is_main_process=is_local_main_process,
+                    safe_serialization=True,
+                )
+                
+                # Save optimizer state (for resuming training)
+                optimizer_path = os.path.join(save_path, "optimizer.pt")
+                torch.save({
+                    'epoch': epoch,
+                    'global_step': global_step,
+                    'optimizer_state_dict': optimizer.state_dict(),
+                }, optimizer_path)
+                
+                logger.info(f"[GRPO] Saved checkpoint to {save_path}")
+            
+            dist.barrier()
 
 def run_sde_sanity(config, pipeline, device, logger):
     prompt_fn = getattr(lib.reward_func.prompts, config.experiment.prompt_fn)

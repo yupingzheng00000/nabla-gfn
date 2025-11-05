@@ -54,6 +54,7 @@ def get_default_configs():
     grpo.group_size = 4
     grpo.beta = 0.1  # Increased from 0.05 to better constrain KL divergence
     grpo.clip_range = 0.2
+    grpo.adv_clip_max = 5.0  # Clamp normalized advantages to stabilise PPO updates (set to 0 to disable)
 
 
     sample = config.sample = config_dict.ConfigDict()
