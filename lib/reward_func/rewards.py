@@ -15,11 +15,13 @@ short_names = {
     "aesthetic_score": "aes",
     "imagereward": "imgr",
     "hpscore": "hps",
+    "pickscore": "pick",
 }
 use_prompt = {
     "aesthetic_score": False,
     "imagereward": True,
     "hpscore": True,
+    "pickscore": True,
 }
 
 def aesthetic_score(dtype=torch.float32, device="cuda", distributed=True):
@@ -145,6 +147,78 @@ def hpscore(dtype=torch.float32, device=torch.device('cuda')):
         return hps_score, {}
 
     return _fn
+
+
+# For PickScore reward
+def pickscore(dtype=torch.float32, device="cuda", distributed=True):
+    from transformers import CLIPProcessor, CLIPModel
+    
+    processor_path = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
+    model_path = "yuvalkirstain/PickScore_v1"
+    
+    if distributed:
+        if get_local_rank() == 0:  # only download once
+            processor = CLIPProcessor.from_pretrained(processor_path)
+            model = CLIPModel.from_pretrained(model_path)
+        dist.barrier()
+    
+    processor = CLIPProcessor.from_pretrained(processor_path)
+    model = CLIPModel.from_pretrained(model_path)
+    model = model.eval().to(device).to(dtype)
+    
+    def _fn(images, prompts, metadata):
+        # images: torch.Tensor in [0, 1], shape (B, 3, H, W)
+        # prompts: list of strings, length B
+        
+        # Convert to PIL for CLIP processor
+        from PIL import Image
+        import numpy as np
+        
+        pil_images = []
+        for img in images:
+            # img: (3, H, W) in [0, 1]
+            img_np = (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            pil_images.append(Image.fromarray(img_np))
+        
+        # Preprocess images
+        image_inputs = processor(
+            images=pil_images,
+            padding=True,
+            truncation=True,
+            max_length=77,
+            return_tensors="pt",
+        )
+        image_inputs = {k: v.to(device=device) for k, v in image_inputs.items()}
+        
+        # Preprocess text
+        text_inputs = processor(
+            text=prompts,
+            padding=True,
+            truncation=True,
+            max_length=77,
+            return_tensors="pt",
+        )
+        text_inputs = {k: v.to(device=device) for k, v in text_inputs.items()}
+        
+        with torch.no_grad():
+            # Get embeddings
+            image_embs = model.get_image_features(**image_inputs)
+            image_embs = image_embs / image_embs.norm(p=2, dim=-1, keepdim=True)
+            
+            text_embs = model.get_text_features(**text_inputs)
+            text_embs = text_embs / text_embs.norm(p=2, dim=-1, keepdim=True)
+            
+            # Calculate scores
+            logit_scale = model.logit_scale.exp()
+            scores = logit_scale * (text_embs @ image_embs.T)
+            scores = scores.diag()
+            # Normalize to 0-1 range (following original implementation)
+            scores = scores / 26.0
+        
+        return scores.float(), {}
+    
+    return _fn
+
 
 if __name__ == "__main__":
     from hpsv2.src.open_clip import create_model_and_transforms, get_tokenizer

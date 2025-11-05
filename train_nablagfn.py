@@ -39,6 +39,7 @@ from lib.diffusion.inference_step import inference_step, predict_clean, get_alph
 from aligners.grpo.sd15_pipeline_with_logprob_fast import sample_group_with_sde_window
 from aligners.grpo.sd15_sde_with_logprob import sde_step_with_logprob
 from aligners.grpo.sd15_pipeline_with_logprob_slow import pipeline_with_logprob_slow
+from aligners.grpo.ddim_grpo_sampler import sample_group_ddim, ddim_step_with_logprob
 
 
 from absl import app
@@ -94,8 +95,14 @@ def setup(local_rank, is_local_main_process):
 
 
     if config.logging.use_wandb:
+        # Try to get wandb key from config, env var, or skip login (let wandb handle it)
         wandb_key = config.logging.wandb_key
-        wandb.login(key=wandb_key)
+        if wandb_key and wandb_key != 'PLACEHOLDER':
+            wandb.login(key=wandb_key)
+        elif 'WANDB_API_KEY' in os.environ:
+            wandb.login(key=os.environ['WANDB_API_KEY'])
+        # else: wandb will use ~/.netrc or prompt for login
+        
         wandb.init(project=config.logging.proj_name, name=wandb_name, config=config.to_dict(),
            dir=config.logging.wandb_dir,
            save_code=True, mode="online" if is_local_main_process else "disabled")
@@ -124,11 +131,10 @@ def setup(local_rank, is_local_main_process):
     num_inference_steps = config.sampling.num_steps
     if FLAGS.mode == "grpo":
         if is_local_main_process:
-            logger.info("GRPO mode: using DPMSolverSinglestepScheduler (SDE)")
-        pipeline.scheduler = DPMSolverSinglestepScheduler.from_config(scheduler_config)
-        pipeline.scheduler.config.algorithm_type = "sde-dpmsolver++"
-        pipeline.scheduler.config.final_sigmas_type = 'sigma_min'
-        config.sampling.guidance_scale = 1.0
+            logger.info("GRPO mode: using DDIMScheduler with eta=1.0 (DDPM-equivalent)")
+        pipeline.scheduler = DDIMScheduler.from_config(scheduler_config)
+        # Note: config.sampling.eta is already 1 in default_config.py (int type)
+        # DDIM with eta=1 is equivalent to DDPM (full stochastic)
         pipeline.scheduler.set_timesteps(num_inference_steps, device=device)
     elif config.sampling.scheduler == 'DPM-solver':
         if is_local_main_process:
@@ -290,10 +296,32 @@ def train_grpo(
     batch_size = int(config.sampling.batch_size)
     num_batches = int(config.sampling.num_batches_per_epoch)
     num_epochs = int(config.training.num_epochs)
-    noise_level = float(config.sample.sde_noise_level)
-    window_size = int(config.sample.sde_window_size)
-    window_range = tuple(config.sample.sde_window_range)
-    same_latent = bool(config.sample.same_latent)
+    eta = float(config.sampling.eta)  # For DDIM, eta=1.0 gives full stochasticity
+    num_inference_steps = int(config.sampling.num_steps)
+    
+    # Timestep subsampling: use only a fraction of timesteps for gradient computation
+    # README: 0.1 for 50-step DDPM, 0.4 for 20-step SDE-DPM-Solver
+    timestep_fraction = float(config.model.timestep_fraction)
+    num_train_timesteps = max(1, int(num_inference_steps * timestep_fraction))
+    
+    # Reward scale: amplify reward signal (teacher's baseline values)
+    # aesthetic: 1e4, hps: 3e6, pickscore: 5e5
+    reward_scale = float(config.model.reward_scale)
+    
+    if is_local_main_process:
+        logger.info("="*70)
+        logger.info("[GRPO] Configuration:")
+        logger.info(f"  Sampler: DDIM (eta={eta})")
+        logger.info(f"  Inference steps: {num_inference_steps}")
+        logger.info(f"  Timestep fraction: {timestep_fraction} ({num_train_timesteps}/{num_inference_steps} steps for gradient)")
+        logger.info(f"  Reward function: {config.experiment.reward_fn}")
+        logger.info(f"  Reward scale: {reward_scale:.2e}")
+        logger.info(f"  KL beta: {beta}")
+        logger.info(f"  PPO clip range: {clip_range}")
+        logger.info(f"  Group size: {group_size}")
+        logger.info(f"  Batch size: {batch_size}")
+        logger.info(f"  Gradient accumulation: {grad_accum}")
+        logger.info("="*70)
 
     unet_module = unet.module if hasattr(unet, "module") else unet
     unet_dtype = next(unet_module.parameters()).dtype
@@ -307,20 +335,21 @@ def train_grpo(
     autocast_kwargs = {"dtype": amp_dtype} if amp_dtype is not None else {}
 
     # Frozen reference pipeline for KL regularisation.
+    # IMPORTANT: Share the same UNet with policy pipeline (which has LoRA)
+    # We'll disable LoRA adapters during reference computation
     ref_pipeline = StableDiffusionPipeline.from_pretrained(
         config.pretrained.model,
         revision=config.pretrained.revision,
         torch_dtype=amp_dtype or torch.float32,
     ).to(device)
-    ref_pipeline.scheduler = DPMSolverSinglestepScheduler.from_config(pipeline.scheduler.config)
-    ref_pipeline.scheduler.config.algorithm_type = "sde-dpmsolver++"
-    ref_pipeline.scheduler.config.final_sigmas_type = 'sigma_min'
+    # Replace ref_pipeline's UNet with the policy UNet (which has LoRA loaded)
+    ref_pipeline.unet = unet
+    ref_pipeline.scheduler = DDIMScheduler.from_config(pipeline.scheduler.config)
     ref_pipeline.scheduler.set_timesteps(config.sampling.num_steps, device=device)
-    ref_pipeline.sample_group_with_sde_window = sample_group_with_sde_window.__get__(ref_pipeline, type(ref_pipeline))
-    ref_pipeline.unet.requires_grad_(False)
     ref_pipeline.text_encoder.requires_grad_(False)
     ref_pipeline.vae.requires_grad_(False)
-    ref_unet = ref_pipeline.unet
+    # Get the underlying module (unwrap DDP if needed) for disable_adapters to work
+    ref_unet = ref_pipeline.unet.module if hasattr(ref_pipeline.unet, 'module') else ref_pipeline.unet
     ref_unet_dtype = next(ref_unet.parameters()).dtype
 
     generator = torch.Generator(device=device)
@@ -340,27 +369,62 @@ def train_grpo(
             prompts = list(prompts)
             prompt_metadata = list(prompt_metadata)
 
+            # Pre-compute timestep indices for gradient computation (memory optimization)
+            timesteps = pipeline.scheduler.timesteps
+            if num_train_timesteps < len(timesteps):
+                if config.sampling.low_var_subsampling:
+                    # Low-variance trunk-based subsampling
+                    # Divide timesteps into n_trunks, sample one step from each trunk
+                    # Prioritize later trunks (more important for denoising)
+                    n_trunks = num_train_timesteps
+                    assert len(timesteps) % n_trunks == 0, f"num_steps ({len(timesteps)}) must be divisible by timestep_fraction*num_steps ({n_trunks})"
+                    
+                    trunk_size = len(timesteps) // n_trunks
+                    step_indices = torch.arange(len(timesteps), device=device)
+                    trunks = step_indices.view(n_trunks, trunk_size)  # (n_trunks, trunk_size)
+                    
+                    # Sample one random step from each trunk
+                    # Reverse order to prioritize later steps (stronger signal)
+                    timestep_indices = []
+                    for i in reversed(range(n_trunks)):
+                        trunk = trunks[i]
+                        # Random index within trunk (changes each batch for variance reduction)
+                        idx = torch.randint(0, trunk_size, (1,), device=device, generator=generator)
+                        timestep_indices.append(trunk[idx].item())
+                    timestep_indices = torch.tensor(sorted(timestep_indices), dtype=torch.long, device=device)
+                else:
+                    # Uniform subsampling (deterministic, evenly spaced)
+                    timestep_indices = torch.linspace(0, len(timesteps) - 1, num_train_timesteps, dtype=torch.long)
+            else:
+                timestep_indices = torch.arange(len(timesteps), dtype=torch.long)
+
             unet.eval()
             with torch.inference_mode():
-                imgs, traj_logprobs, timesteps_window, logp_sum_old, window_state = pipeline.sample_group_with_sde_window(
+                # Sample using DDIM with eta=1.0 (full stochastic, equivalent to DDPM)
+                # Only save latents at timestep_indices to reduce memory usage
+                imgs, log_probs_per_step, log_probs_sum_old, all_latents = sample_group_ddim(
+                    pipeline,
                     prompts,
                     group_size,
-                    window_size,
-                    window_range,
-                    num_inference_steps=config.sampling.num_steps,
-                    guidance_scale=1.0,
+                    num_inference_steps=num_inference_steps,
+                    guidance_scale=config.sampling.guidance_scale,  # Use config value (default 5.0)
+                    eta=eta,
                     generator=generator,
-                    same_latent=same_latent,
-                    noise_level=noise_level,
+                    height=512,
+                    width=512,
+                    timestep_indices_to_save=timestep_indices,
                 )
             unet.train()
 
             num_branches = batch_size * group_size
             imgs = imgs.to(device=device, dtype=torch.float32)
-            traj_logprobs = traj_logprobs.to(device=device, dtype=torch.float32)
-            logp_sum_old = logp_sum_old.to(device=device, dtype=torch.float32)
-            window_inputs = window_state["inputs"].to(device=device, dtype=torch.float32)
-            window_outputs = window_state["outputs"].to(device=device, dtype=torch.float32)
+            log_probs_per_step = log_probs_per_step.to(device=device, dtype=torch.float32)
+            log_probs_sum_old = log_probs_sum_old.to(device=device, dtype=torch.float32)
+
+            # IMPORTANT: Align old log-prob sum to the same subset of timesteps used for recomputation
+            # Otherwise, comparing sum over all steps (old) vs sum over subset (new) will explode the ratio.
+            step_idx_dev = timestep_indices.to(log_probs_per_step.device)
+            log_probs_sum_old_subset = log_probs_per_step.index_select(dim=-1, index=step_idx_dev).sum(dim=-1)
 
             # Compute rewards.
             images_flat = imgs.view(num_branches, *imgs.shape[2:])
@@ -371,8 +435,10 @@ def train_grpo(
             reward_mean = rewards.mean().item()
             reward_std = rewards.std(unbiased=False).item()
 
+            # Compute advantages (group-wise normalization) and apply reward_scale
             advantages = rewards - rewards.mean(dim=1, keepdim=True)
             advantages = advantages / (rewards.std(dim=1, keepdim=True) + 1e-6)
+            advantages = advantages * reward_scale  # Amplify the training signal
 
             # Encode prompts manually (CFG-free) to match sampler behavior.
             tok = pipeline.tokenizer(
@@ -386,35 +452,94 @@ def train_grpo(
             prompt_embeds = prompt_embeds.repeat_interleave(group_size, dim=0)
             prompt_embeds_model = prompt_embeds.to(unet_dtype)
 
-            logp_new_steps = []
+            # Recompute log-probs using timestep subsampling (for efficiency)
+            # timestep_indices already computed before sampling
+            # OPTIMIZATION: Micro-batch over the flattened batch dimension to reduce peak memory
+            total = batch_size * group_size
+            micro_bs = max(1, min(total, 4))  # tuneable; 4 is a good balance on 80GB
+            logp_sum_new_flat = torch.zeros(total, device=device, dtype=torch.float32)
+            prompt_embeds_model_full = prompt_embeds_model  # (total, 77, dim)
+            
+            # For UNet regularization: collect policy and reference UNet outputs
+            unet_reg_loss = 0.0
+            num_reg_steps = 0
+
             with (autocast_ctx(**autocast_kwargs) if autocast_kwargs else autocast_ctx()):
-                for step_idx, timestep_value in enumerate(timesteps_window):
-                    latents_in = window_inputs[step_idx].reshape(num_branches, *window_inputs.shape[3:])
-                    latents_out = window_outputs[step_idx].reshape(num_branches, *window_outputs.shape[3:])
-                    timestep_tensor = torch.full((num_branches,), timestep_value, device=device, dtype=torch.float32)
+                for start in range(0, total, micro_bs):
+                    end = min(start + micro_bs, total)
+                    acc_slice = torch.zeros(end - start, device=device, dtype=torch.float32)
 
-                    latent_model_input = pipeline.scheduler.scale_model_input(latents_in.to(unet_dtype), timestep_tensor)
-                    noise_pred = unet(
-                        latent_model_input,
-                        timestep_tensor,
-                        encoder_hidden_states=prompt_embeds_model,
-                        return_dict=False,
-                    )[0]
-                    _, log_prob_new, _, _ = sde_step_with_logprob(
-                        pipeline.scheduler,
-                        noise_pred,
-                        timestep_tensor,
-                        latents_in,
-                        noise_level=noise_level,
-                        prev_sample=latents_out,
-                    )
-                    logp_new_steps.append(log_prob_new.to(torch.float32))
+                    embeds_slice = prompt_embeds_model_full[start:end]
 
-            logp_new = torch.stack(logp_new_steps, dim=1).view(batch_size, group_size, -1)
-            logp_sum_new = logp_new.sum(dim=-1)
+                    for step_idx in timestep_indices:
+                        step_idx = int(step_idx.item()) if isinstance(step_idx, torch.Tensor) else int(step_idx)
+                        t = timesteps[step_idx]
 
+                        # Load only the current micro-batch latents on-demand
+                        latents_in = all_latents[step_idx][start:end].to(device)  # (micro_bs, 4, H/8, W/8)
+                        latents_out = all_latents[step_idx + 1][start:end].to(device)
+
+                        # Predict noise with current policy for the micro-batch
+                        latent_model_input = pipeline.scheduler.scale_model_input(latents_in.to(unet_dtype), t)
+                        noise_pred_policy = unet(
+                            latent_model_input,
+                            t,
+                            encoder_hidden_states=embeds_slice,
+                            return_dict=False,
+                        )[0]
+
+                        # Compute UNet regularization if enabled (L2 distance to reference model)
+                        if config.model.unet_reg_scale > 0:
+                            with torch.no_grad():
+                                # Get reference model prediction (disable LoRA)
+                                unet_module = unet.module if hasattr(unet, 'module') else unet
+                                unet_module.disable_adapters()
+                                noise_pred_ref = unet(
+                                    latent_model_input,
+                                    t,
+                                    encoder_hidden_states=embeds_slice,
+                                    return_dict=False,
+                                )[0]
+                                unet_module.enable_adapters()
+                            
+                            # Compute L2 difference per sample, mean over spatial dims
+                            unet_diff = (noise_pred_policy - noise_pred_ref).pow(2)
+                            unet_reg_batch = torch.mean(unet_diff, dim=(1, 2, 3))  # (micro_bs,)
+                            unet_reg_loss += unet_reg_batch.sum().item()
+                            num_reg_steps += (end - start)
+                            del noise_pred_ref, unet_diff, unet_reg_batch
+
+                        # Compute log-prob using DDIM formula (micro-batch)
+                        timestep_int = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
+                        _, log_prob_new = ddim_step_with_logprob(
+                            pipeline.scheduler,
+                            model_output=noise_pred_policy,
+                            timestep=timestep_int,
+                            sample=latents_in,
+                            eta=eta,
+                            prev_sample=latents_out,
+                        )
+                        acc_slice = acc_slice + log_prob_new.to(torch.float32)
+
+                        # Free GPU memory for this micro-batch slice immediately
+                        del latents_in, latents_out, latent_model_input, noise_pred_policy
+                        torch.cuda.empty_cache()
+
+                    logp_sum_new_flat[start:end] = acc_slice
+
+            logp_sum_new = logp_sum_new_flat.view(batch_size, group_size)
+
+            # Compute reference log-probs for KL regularization (use same subsampled timesteps)
             with torch.inference_mode():
-                ref_logp_steps = []
+                # CRITICAL: Disable LoRA for reference policy to get base model behavior
+                # Need to access .module for DDP-wrapped models
+                unet_module = unet.module if hasattr(unet, 'module') else unet
+                unet_module.disable_adapters()
+                
+                # KL reference log-probs (micro-batched over batch dimension)
+                total = batch_size * group_size
+                micro_bs = max(1, min(total, 4))
+                logp_ref_flat = torch.zeros(total, device=device, dtype=torch.float32)
                 # Reference embeddings computed with reference text encoder for stability
                 tok_ref = pipeline.tokenizer(
                     prompts,
@@ -423,40 +548,78 @@ def train_grpo(
                     truncation=True,
                     max_length=pipeline.tokenizer.model_max_length,
                 ).to(device)
-                prompt_embeds_ref = ref_pipeline.text_encoder(tok_ref.input_ids)[0]
-                prompt_embeds_ref = prompt_embeds_ref.repeat_interleave(group_size, dim=0).to(ref_unet_dtype)
-                for step_idx, timestep_value in enumerate(timesteps_window):
-                    latents_in = window_inputs[step_idx].reshape(num_branches, *window_inputs.shape[3:])
-                    latents_out = window_outputs[step_idx].reshape(num_branches, *window_outputs.shape[3:])
-                    timestep_tensor = torch.full((num_branches,), timestep_value, device=device, dtype=torch.float32)
-                    latent_model_input = ref_pipeline.scheduler.scale_model_input(latents_in.to(ref_unet_dtype), timestep_tensor)
-                    noise_pred_ref = ref_unet(
-                        latent_model_input,
-                        timestep_tensor,
-                        encoder_hidden_states=prompt_embeds_ref,
-                        return_dict=False,
-                    )[0]
-                    _, log_prob_ref, _, _ = sde_step_with_logprob(
-                        ref_pipeline.scheduler,
-                        noise_pred_ref,
-                        timestep_tensor,
-                        latents_in,
-                        noise_level=noise_level,
-                        prev_sample=latents_out,
-                    )
-                    ref_logp_steps.append(log_prob_ref.to(torch.float32))
-                logp_ref = torch.stack(ref_logp_steps, dim=1).view(batch_size, group_size, -1).sum(dim=-1)
+                prompt_embeds_ref_full = ref_pipeline.text_encoder(tok_ref.input_ids)[0]
+                prompt_embeds_ref_full = prompt_embeds_ref_full.repeat_interleave(group_size, dim=0).to(ref_unet_dtype)
 
-            delta_logp = logp_sum_new - logp_sum_old
+                for start in range(0, total, micro_bs):
+                    end = min(start + micro_bs, total)
+                    acc_slice = torch.zeros(end - start, device=device, dtype=torch.float32)
+                    embeds_ref_slice = prompt_embeds_ref_full[start:end]
+
+                    for step_idx in timestep_indices:
+                        step_idx = int(step_idx.item()) if isinstance(step_idx, torch.Tensor) else int(step_idx)
+                        t = timesteps[step_idx]
+                        # Load on-demand for micro-batch
+                        latents_in = all_latents[step_idx][start:end].to(device)
+                        latents_out = all_latents[step_idx + 1][start:end].to(device)
+
+                        latent_model_input = ref_pipeline.scheduler.scale_model_input(latents_in.to(ref_unet_dtype), t)
+                        noise_pred_ref = ref_unet(
+                            latent_model_input,
+                            t,
+                            encoder_hidden_states=embeds_ref_slice,
+                            return_dict=False,
+                        )[0]
+
+                        timestep_int = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
+                        _, log_prob_ref = ddim_step_with_logprob(
+                            ref_pipeline.scheduler,
+                            model_output=noise_pred_ref,
+                            timestep=timestep_int,
+                            sample=latents_in,
+                            eta=eta,
+                            prev_sample=latents_out,
+                        )
+                        acc_slice = acc_slice + log_prob_ref.to(torch.float32)
+
+                        # Free GPU memory for this micro-batch slice immediately
+                        del latents_in, latents_out, latent_model_input, noise_pred_ref
+                        torch.cuda.empty_cache()
+
+                    logp_ref_flat[start:end] = acc_slice
+
+                logp_ref = logp_ref_flat.view(batch_size, group_size)
+                
+                # Re-enable LoRA for policy updates
+                unet_module.enable_adapters()
+
+            # Use subset-aligned old log-prob sum for a fair comparison
+            delta_logp = logp_sum_new - log_probs_sum_old_subset
             if clip_range > 0.0:
                 delta_clamped = delta_logp.clamp(min=-clip_range, max=clip_range)
             else:
                 delta_clamped = delta_logp
-            logp_clipped = logp_sum_old + delta_clamped
+            logp_clipped = log_probs_sum_old + delta_clamped
 
             loss_policy = -(advantages * logp_clipped).mean()
             loss_kl = ((logp_sum_new.detach() - logp_ref) ** 2).mean()
-            loss = loss_policy + beta * loss_kl
+            
+            # Add UNet regularization to loss
+            if config.model.unet_reg_scale > 0:
+                unet_reg_mean = unet_reg_loss / max(num_reg_steps, 1)
+                loss = loss_policy + beta * loss_kl + config.model.unet_reg_scale * unet_reg_mean
+            else:
+                unet_reg_mean = 0.0
+                loss = loss_policy + beta * loss_kl
+            
+            # DEBUG: Print logp values to diagnose KL=0
+            if is_local_main_process and batch_idx == 0:
+                logger.info(f"[DEBUG] logp_sum_new: mean={logp_sum_new.mean().item():.4f} std={logp_sum_new.std().item():.4f}")
+                logger.info(f"[DEBUG] logp_ref: mean={logp_ref.mean().item():.4f} std={logp_ref.std().item():.4f}")
+                logger.info(f"[DEBUG] diff: mean={(logp_sum_new - logp_ref).mean().item():.6f} std={(logp_sum_new - logp_ref).std().item():.6f}")
+                if config.model.unet_reg_scale > 0:
+                    logger.info(f"[DEBUG] unet_reg: {unet_reg_mean:.6f}")
+            
             loss = loss / grad_accum
 
             if scaler is not None:
@@ -476,27 +639,99 @@ def train_grpo(
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
+            # Compute monitoring metrics
             ratio = torch.exp(delta_logp.detach()).mean().item()
+            kl_div = ((logp_sum_new.detach() - logp_ref) ** 2).mean().item()
+            clip_fraction = ((torch.abs(delta_logp) > clip_range).float().mean().item() if clip_range > 0 else 0.0)
+            advantage_mean = advantages.mean().item()
+            advantage_std = advantages.std().item()
+            
+            # Warning if ratio deviates significantly from 1.0 (on-policy target)
             if is_local_main_process and abs(ratio - 1.0) > 0.02:
-                logger.warning(f"[GRPO] ratio deviates from on-policy target: {ratio:.3f}")
+                logger.warning(f"[GRPO] ratio deviates from on-policy: {ratio:.3f}")
+            
+            # Warning if KL divergence is too high
+            if is_local_main_process and kl_div > 0.3:
+                logger.warning(f"[GRPO] High KL divergence: {kl_div:.4f} (consider increasing beta or reducing reward_scale)")
 
             if is_local_main_process:
-                logger.debug(f"[GRPO] window timesteps: {timesteps_window}")
-                logger.info(
-                    f"[GRPO] epoch {epoch} batch {batch_idx} | loss={loss_policy.item():.4f} "
-                    f"kl={loss_kl.item():.4f} reward_mean={reward_mean:.3f} ratio={ratio:.3f}"
+                log_msg = (
+                    f"[GRPO] epoch {epoch} batch {batch_idx}/{num_batches} | "
+                    f"loss={loss_policy.item():.4f} kl={kl_div:.4f}"
                 )
+                if config.model.unet_reg_scale > 0:
+                    log_msg += f" ureg={unet_reg_mean:.4f}"
+                log_msg += (
+                    f" | reward={reward_mean:.3f}±{reward_std:.3f} adv={advantage_mean:.2e}±{advantage_std:.2e} | "
+                    f"ratio={ratio:.3f} clip_frac={clip_fraction:.3f}"
+                )
+                logger.info(log_msg)
+                
                 if config.logging.use_wandb:
-                    wandb.log(
-                        {
-                            "loss/policy": loss_policy.item(),
-                            "loss/kl": loss_kl.item(),
-                            "reward/mean": reward_mean,
-                            "reward/std": reward_std,
-                            "ratio/mean": ratio,
-                        },
-                        step=global_step,
-                    )
+                    # Log metrics at actual training step (only when optimizer.step() is called)
+                    # Note: We log every batch for monitoring, but global_step only increments on actual updates
+                    log_dict = {
+                        "loss/policy": loss_policy.item(),
+                        "loss/kl": kl_div,
+                        "loss/total": loss.item() * grad_accum,
+                        "reward/mean": reward_mean,
+                        "reward/std": reward_std,
+                        "advantage/mean": advantage_mean,
+                        "advantage/std": advantage_std,
+                        "ratio/mean": ratio,
+                        "ratio/clip_fraction": clip_fraction,
+                        "kl/divergence": kl_div,
+                        "epoch": epoch,
+                        "batch_idx": batch_idx,
+                        "global_step": global_step,
+                    }
+                    if config.model.unet_reg_scale > 0:
+                        log_dict["loss/unet_reg"] = unet_reg_mean
+                    wandb.log(log_dict, step=global_step)
+            
+            # Save images (optional, last batch of each epoch for visualization)
+            if batch_idx == num_batches - 1:  # Last batch of epoch
+                if is_local_main_process and (epoch % 5 == 0 or epoch == 0):  # Every 5 epochs + epoch 0
+                    images_dir = os.path.join(config.saving.output_dir, f"images_epoch{epoch}")
+                    os.makedirs(images_dir, exist_ok=True)
+                    # imgs shape: (batch_size, group_size, 3, H, W), already in [0,1] range
+                    imgs_flat = imgs.view(-1, *imgs.shape[2:])  # (batch*group, 3, H, W)
+                    for i in range(min(16, imgs_flat.shape[0])):
+                        image_np = imgs_flat[i].cpu().float().numpy()  # (3, H, W)
+                        image_np = (image_np.transpose(1, 2, 0) * 255).astype(np.uint8)  # (H, W, 3)
+                        pil = Image.fromarray(image_np)
+                        pil = pil.resize((256, 256))
+                        pil.save(os.path.join(images_dir, f"{i}.jpg"))
+                
+                # Upload to wandb (last batch of epoch)
+                if config.logging.use_wandb and is_local_main_process and (epoch % 5 == 0 or epoch == 0):
+                    import tempfile
+                    # imgs shape: (batch_size, group_size, 3, H, W)
+                    imgs_flat = imgs.view(-1, *imgs.shape[2:])  # (batch*group, 3, H, W)
+                    num_imgs_to_log = min(16, imgs_flat.shape[0])
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        for i in range(num_imgs_to_log):
+                            image_np = imgs_flat[i].cpu().float().numpy()  # (3, H, W)
+                            image_np = (image_np.transpose(1, 2, 0) * 255).astype(np.uint8)  # (H, W, 3)
+                            pil = Image.fromarray(image_np)
+                            pil = pil.resize((256, 256))
+                            pil.save(os.path.join(tmpdir, f"{i}.jpg"))
+                        wandb.log(
+                            {
+                                "sample_images": [
+                                    wandb.Image(
+                                        os.path.join(tmpdir, f"{i}.jpg"),
+                                        caption=f"{prompts[i // group_size] if i < len(prompts) * group_size else 'extra'} | {rewards_flat[i].item():.2f}"
+                                    )
+                                    for i in range(num_imgs_to_log)
+                                ]
+                            },
+                            step=global_step,  # Use actual training step
+                        )
+            
+            # Clear latents dict to free CPU memory for next batch
+            all_latents.clear()
+            torch.cuda.empty_cache()
 
 def run_sde_sanity(config, pipeline, device, logger):
     prompt_fn = getattr(lib.reward_func.prompts, config.experiment.prompt_fn)

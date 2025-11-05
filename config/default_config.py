@@ -24,12 +24,12 @@ def get_default_configs():
 
     model = config.model = config_dict.ConfigDict()
     model.lora_rank = 8
-    model.reward_scale = 1e3
+    model.reward_scale = 1e3  # Kept at 1e3 (was 1e4 in init.sh, now corrected)
     model.timestep_fraction = 0.1
     ### GFN Specific
     model.flow_layers_per_block = 1
     model.flow_channel_width = (64, 128, 256, 256)
-    model.unet_reg_scale = 1e3
+    model.unet_reg_scale = 1e3  # Now also used in GRPO for stability
     model.reverse_loss_scale = 1.0
     model.no_flow = False
     model.pretrained_strength = 1.0
@@ -52,7 +52,7 @@ def get_default_configs():
     grpo = config.grpo = config_dict.ConfigDict()
     grpo.enabled = False
     grpo.group_size = 4
-    grpo.beta = 0.05
+    grpo.beta = 0.1  # Increased from 0.05 to better constrain KL divergence
     grpo.clip_range = 0.2
 
 
