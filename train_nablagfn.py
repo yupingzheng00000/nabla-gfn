@@ -41,6 +41,14 @@ from aligners.grpo.sd15_sde_with_logprob import sde_step_with_logprob
 from aligners.grpo.sd15_pipeline_with_logprob_slow import pipeline_with_logprob_slow
 from aligners.grpo.ddim_grpo_sampler import sample_group_ddim, ddim_step_with_logprob
 
+# DreamSim for diversity calculation
+try:
+    from dreamsim import dreamsim
+    DREAMSIM_AVAILABLE = True
+except ImportError:
+    DREAMSIM_AVAILABLE = False
+    print("Warning: dreamsim not available. Diversity metrics will be disabled.")
+
 
 from absl import app
 from absl import flags
@@ -153,6 +161,11 @@ def setup(local_rank, is_local_main_process):
     pipeline.scheduler.set_timesteps(config.sampling.num_steps, device=device)  # set_timesteps(): 1000 steps -> 50 steps
 
     pipeline.safety_checker = None
+    # Save memory during VAE encode/decode
+    try:
+        pipeline.enable_vae_slicing()
+    except Exception:
+        pass
     pipeline.set_progress_bar_config(
         position=1,
         disable=not is_local_main_process,
@@ -172,6 +185,16 @@ def setup(local_rank, is_local_main_process):
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
     )
     unet.add_adapter(unet_lora_config, adapter_name="pf") ## LoRA
+
+    # Enable gradient checkpointing to reduce activation memory
+    if getattr(config.training, "gradient_checkpointing", True):
+        try:
+            unet.enable_gradient_checkpointing()
+            if is_local_main_process:
+                logger.info("Enabled UNet gradient checkpointing")
+        except Exception as e:
+            if is_local_main_process:
+                logger.warning(f"Failed to enable gradient checkpointing: {e}")
 
     if is_xformers_available():
         import xformers
@@ -214,7 +237,8 @@ def setup(local_rank, is_local_main_process):
         flow_params = filter(lambda p: p.requires_grad, res_logflowscore_model.parameters())
 
     if config.training.mixed_precision in ["fp16", "bf16"]:
-        scaler = torch.cuda.amp.GradScaler(
+        scaler = torch.amp.GradScaler(
+            "cuda",
             growth_interval=config.training.gradscaler_growth_interval
         )
 
@@ -266,7 +290,25 @@ def setup(local_rank, is_local_main_process):
         eps=config.training.adam_epsilon,
     )
 
-    return config, pipeline, optimizer, unet, res_logflowscore_model, sample_neg_prompt_embeds, train_neg_prompt_embeds, logger, scaler
+    # Load DreamSim model for diversity calculation (only on main process)
+    dreamsim_model = None
+    dreamsim_preprocess = None
+    if DREAMSIM_AVAILABLE and is_local_main_process:
+        try:
+            dreamsim_model, dreamsim_preprocess = dreamsim(
+                pretrained=True, 
+                device=device,
+                cache_dir="./models"
+            )
+            dreamsim_model.eval()
+            for param in dreamsim_model.parameters():
+                param.requires_grad = False
+            logger.info("DreamSim model loaded for diversity calculation")
+        except Exception as e:
+            logger.warning(f"Failed to load DreamSim: {e}. Diversity metrics disabled.")
+            dreamsim_model = None
+
+    return config, pipeline, optimizer, unet, res_logflowscore_model, sample_neg_prompt_embeds, train_neg_prompt_embeds, logger, scaler, dreamsim_model, dreamsim_preprocess
 
 
 def train_grpo(
@@ -281,6 +323,8 @@ def train_grpo(
     scaler,
     device,
     is_local_main_process,
+    dreamsim_model=None,
+    dreamsim_preprocess=None,
 ):
     pipeline.unet.eval()
     unet.train()
@@ -326,6 +370,8 @@ def train_grpo(
         logger.info(f"  Group size: {group_size}")
         logger.info(f"  Batch size: {batch_size}")
         logger.info(f"  Gradient accumulation: {grad_accum}")
+        logger.info(f"  Grad checkpointing: {getattr(config.training, 'gradient_checkpointing', True)}")
+        logger.info(f"  Micro-batch size: {getattr(config.grpo, 'micro_batch_size', 4)}")
         logger.info("="*70)
 
     unet_module = unet.module if hasattr(unet, "module") else unet
@@ -412,7 +458,7 @@ def train_grpo(
                     prompts,
                     group_size,
                     num_inference_steps=num_inference_steps,
-                    guidance_scale=config.sampling.guidance_scale,  # Use config value (default 5.0)
+                    guidance_scale=config.sampling.guidance_scale,  # Training guidance (default 1.0)
                     eta=eta,
                     generator=generator,
                     height=512,
@@ -444,6 +490,8 @@ def train_grpo(
             advantages = rewards - rewards.mean(dim=1, keepdim=True)
             advantages = advantages / (rewards.std(dim=1, keepdim=True) + 1e-6)
             advantages = advantages * reward_scale  # Amplify the training signal
+            # Store pre-clipping advantage for saturation analysis
+            advantages_pre_clip = advantages.clone() if adv_clip_max > 0 else None
             if adv_clip_max > 0:
                 advantages = advantages.clamp_(-adv_clip_max, adv_clip_max)
 
@@ -457,19 +505,36 @@ def train_grpo(
             ).to(device)
             prompt_embeds = pipeline.text_encoder(tok.input_ids)[0]
             prompt_embeds = prompt_embeds.repeat_interleave(group_size, dim=0)
-            prompt_embeds_model = prompt_embeds.to(unet_dtype)
+            prompt_embeds_model_full = prompt_embeds.to(unet_dtype)
+
+            guidance_scale = float(config.sampling.guidance_scale)
+            do_classifier_free_guidance = guidance_scale > 1.0 + 1e-6
+            if do_classifier_free_guidance:
+                tok_uncond = pipeline.tokenizer(
+                    [""] * len(prompts),
+                    return_tensors="pt",
+                    padding="max_length",
+                    truncation=True,
+                    max_length=pipeline.tokenizer.model_max_length,
+                ).to(device)
+                uncond_embeds = pipeline.text_encoder(tok_uncond.input_ids)[0]
+                uncond_embeds = uncond_embeds.repeat_interleave(group_size, dim=0)
+                uncond_embeds_model_full = uncond_embeds.to(unet_dtype)
+            else:
+                uncond_embeds = None
+                uncond_embeds_model_full = None
 
             # Recompute log-probs using timestep subsampling (for efficiency)
             # timestep_indices already computed before sampling
             # OPTIMIZATION: Micro-batch over the flattened batch dimension to reduce peak memory
             total = batch_size * group_size
-            micro_bs = max(1, min(total, 4))  # tuneable; 4 is a good balance on 80GB
+            micro_bs_cfg = int(getattr(config.grpo, "micro_batch_size", 4) or 4)
+            micro_bs = max(1, min(total, micro_bs_cfg))  # tuneable via config.grpo.micro_batch_size
             logp_sum_new_flat = torch.zeros(total, device=device, dtype=torch.float32)
-            prompt_embeds_model_full = prompt_embeds_model  # (total, 77, dim)
             
-            # For UNet regularization: collect policy and reference UNet outputs
-            unet_reg_loss = 0.0
-            num_reg_steps = 0
+            # For latent-space KL (flow_grpo style): collect UNet output differences
+            kl_latent_loss = 0.0
+            num_kl_steps = 0
 
             with (autocast_ctx(**autocast_kwargs) if autocast_kwargs else autocast_ctx()):
                 for start in range(0, total, micro_bs):
@@ -477,44 +542,108 @@ def train_grpo(
                     acc_slice = torch.zeros(end - start, device=device, dtype=torch.float32)
 
                     embeds_slice = prompt_embeds_model_full[start:end]
+                    if do_classifier_free_guidance:
+                        uncond_embeds_slice = uncond_embeds_model_full[start:end]
+                    else:
+                        uncond_embeds_slice = None
 
                     for step_idx in timestep_indices:
                         step_idx = int(step_idx.item()) if isinstance(step_idx, torch.Tensor) else int(step_idx)
                         t = timesteps[step_idx]
 
-                        # Load only the current micro-batch latents on-demand
-                        latents_in = all_latents[step_idx][start:end].to(device)  # (micro_bs, 4, H/8, W/8)
-                        latents_out = all_latents[step_idx + 1][start:end].to(device)
+                        # Load only the current micro-batch latents on-demand (keep float32 for log-prob accuracy)
+                        latents_in = all_latents[step_idx][start:end].to(device=device, dtype=torch.float32)  # (micro_bs, 4, H/8, W/8)
+                        latents_out = all_latents[step_idx + 1][start:end].to(device=device, dtype=torch.float32)
 
-                        # Predict noise with current policy for the micro-batch
-                        latent_model_input = pipeline.scheduler.scale_model_input(latents_in.to(unet_dtype), t)
-                        noise_pred_policy = unet(
+                        # Predict noise with current policy for the micro-batch (heavy math can stay in mixed precision)
+                        latents_in_unet = latents_in.to(unet_dtype)
+                        if do_classifier_free_guidance:
+                            latent_model_input = torch.cat([latents_in_unet, latents_in_unet], dim=0)
+                        else:
+                            latent_model_input = latents_in_unet
+                        latent_model_input = pipeline.scheduler.scale_model_input(latent_model_input, t)
+
+                        if do_classifier_free_guidance:
+                            encoder_hidden_states = torch.cat([uncond_embeds_slice, embeds_slice], dim=0)
+                        else:
+                            encoder_hidden_states = embeds_slice
+
+                        noise_pred = unet(
                             latent_model_input,
                             t,
-                            encoder_hidden_states=embeds_slice,
+                            encoder_hidden_states=encoder_hidden_states,
                             return_dict=False,
                         )[0]
 
-                        # Compute UNet regularization if enabled (L2 distance to reference model)
-                        if config.model.unet_reg_scale > 0:
-                            with torch.no_grad():
-                                # Get reference model prediction (disable LoRA)
-                                unet_module = unet.module if hasattr(unet, 'module') else unet
-                                unet_module.disable_adapters()
-                                noise_pred_ref = unet(
-                                    latent_model_input,
-                                    t,
-                                    encoder_hidden_states=embeds_slice,
-                                    return_dict=False,
-                                )[0]
-                                unet_module.enable_adapters()
-                            
-                            # Compute L2 difference per sample, mean over spatial dims
-                            unet_diff = (noise_pred_policy - noise_pred_ref).pow(2)
-                            unet_reg_batch = torch.mean(unet_diff, dim=(1, 2, 3))  # (micro_bs,)
-                            unet_reg_loss += unet_reg_batch.sum().item()
-                            num_reg_steps += (end - start)
-                            del noise_pred_ref, unet_diff, unet_reg_batch
+                        if do_classifier_free_guidance:
+                            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                            noise_pred_policy = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                        else:
+                            noise_pred_policy = noise_pred
+                        noise_pred_policy = noise_pred_policy.to(torch.float32)
+
+                        # Compute latent-space KL (flow_grpo style): compare next-step latent means with timestep normalization
+                        with torch.no_grad():
+                            # Get reference model prediction (disable LoRA)
+                            unet_module = unet.module if hasattr(unet, 'module') else unet
+                            unet_module.disable_adapters()
+                            noise_pred_ref_full = unet(
+                                latent_model_input,
+                                t,
+                                encoder_hidden_states=encoder_hidden_states,
+                                return_dict=False,
+                            )[0]
+                            unet_module.enable_adapters()
+                        
+                        if do_classifier_free_guidance:
+                            noise_pred_ref_uncond, noise_pred_ref_text = noise_pred_ref_full.chunk(2)
+                            noise_pred_ref = noise_pred_ref_uncond + guidance_scale * (noise_pred_ref_text - noise_pred_ref_uncond)
+                        else:
+                            noise_pred_ref = noise_pred_ref_full
+                        noise_pred_ref = noise_pred_ref.to(torch.float32)
+                        
+                        # Compute DDIM prev_sample_mean for both policy and reference (formula 12 from DDIM paper)
+                        # prev_sample_mean = sqrt(α_{t-1}) * x0 + sqrt(1 - α_{t-1} - σ²_t) * ε
+                        timestep_int = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
+                        prev_timestep_int = max(0, timestep_int - pipeline.scheduler.config.num_train_timesteps // pipeline.scheduler.num_inference_steps)
+                        
+                        alpha_prod_t = pipeline.scheduler.alphas_cumprod[timestep_int].to(device)
+                        alpha_prod_t_prev = pipeline.scheduler.alphas_cumprod[prev_timestep_int].to(device) if prev_timestep_int >= 0 else pipeline.scheduler.final_alpha_cumprod.to(device)
+                        beta_prod_t = 1 - alpha_prod_t
+                        
+                        # Predict x0 from noise following scheduler prediction_type
+                        pred_type = getattr(pipeline.scheduler.config, "prediction_type", "epsilon")
+                        if pred_type == "epsilon":
+                            # Standard case for SD1.5
+                            x0_policy = (latents_in - torch.sqrt(beta_prod_t) * noise_pred_policy) / torch.sqrt(alpha_prod_t)
+                            x0_ref = (latents_in - torch.sqrt(beta_prod_t) * noise_pred_ref) / torch.sqrt(alpha_prod_t)
+                        elif pred_type == "sample":
+                            # Model directly predicts x0
+                            x0_policy = noise_pred_policy
+                            x0_ref = noise_pred_ref
+                        elif pred_type == "v_prediction":
+                            # pred_original_sample = sqrt(alpha_t) * x_t - sqrt(beta_t) * v
+                            x0_policy = torch.sqrt(alpha_prod_t) * latents_in - torch.sqrt(beta_prod_t) * noise_pred_policy
+                            x0_ref = torch.sqrt(alpha_prod_t) * latents_in - torch.sqrt(beta_prod_t) * noise_pred_ref
+                        else:
+                            raise ValueError(f"Unsupported scheduler prediction_type: {pred_type}")
+                        
+                        # Compute DDIM variance: σ_t² = η² * β_{t-1} / β_t * (1 - α_t / α_{t-1})
+                        variance = (1 - alpha_prod_t_prev) / (1 - alpha_prod_t) * (1 - alpha_prod_t / alpha_prod_t_prev)
+                        std_dev_t = eta * torch.sqrt(variance)
+                        
+                        # Compute prev_sample_mean (next-step latent mean)
+                        # prev_sample_mean = sqrt(α_{t-1}) * x0 + sqrt(1 - α_{t-1} - σ²_t) * ε
+                        pred_sample_direction_coeff = torch.sqrt(1 - alpha_prod_t_prev - std_dev_t**2)
+                        prev_sample_mean_policy = torch.sqrt(alpha_prod_t_prev) * x0_policy + pred_sample_direction_coeff * noise_pred_policy
+                        prev_sample_mean_ref = torch.sqrt(alpha_prod_t_prev) * x0_ref + pred_sample_direction_coeff * noise_pred_ref
+                        
+                        # KL loss: L2 distance between next-step means, normalized by DDIM noise std
+                        kl_step = ((prev_sample_mean_policy - prev_sample_mean_ref) ** 2).mean(dim=(1, 2, 3)) / (2 * std_dev_t ** 2 + 1e-8)
+                        kl_latent_loss += kl_step.sum().item()
+                        num_kl_steps += (end - start)
+                        
+                        del noise_pred_ref, noise_pred_ref_full, x0_policy, x0_ref, prev_sample_mean_policy, prev_sample_mean_ref
 
                         # Compute log-prob using DDIM formula (micro-batch)
                         timestep_int = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
@@ -529,7 +658,7 @@ def train_grpo(
                         acc_slice = acc_slice + log_prob_new.to(torch.float32)
 
                         # Free GPU memory for this micro-batch slice immediately
-                        del latents_in, latents_out, latent_model_input, noise_pred_policy
+                        del latents_in, latents_out, latents_in_unet, latent_model_input, noise_pred_policy, noise_pred
                         torch.cuda.empty_cache()
 
                     logp_sum_new_flat[start:end] = acc_slice
@@ -545,7 +674,7 @@ def train_grpo(
                 
                 # KL reference log-probs (micro-batched over batch dimension)
                 total = batch_size * group_size
-                micro_bs = max(1, min(total, 4))
+                micro_bs = max(1, min(total, micro_bs_cfg))
                 logp_ref_flat = torch.zeros(total, device=device, dtype=torch.float32)
                 # Reference embeddings computed with reference text encoder for stability
                 tok_ref = pipeline.tokenizer(
@@ -557,6 +686,10 @@ def train_grpo(
                 ).to(device)
                 prompt_embeds_ref_full = ref_pipeline.text_encoder(tok_ref.input_ids)[0]
                 prompt_embeds_ref_full = prompt_embeds_ref_full.repeat_interleave(group_size, dim=0).to(ref_unet_dtype)
+                if do_classifier_free_guidance and uncond_embeds is not None:
+                    uncond_embeds_ref_full = uncond_embeds.to(ref_unet_dtype)
+                else:
+                    uncond_embeds_ref_full = None
 
                 for start in range(0, total, micro_bs):
                     end = min(start + micro_bs, total)
@@ -566,17 +699,34 @@ def train_grpo(
                     for step_idx in timestep_indices:
                         step_idx = int(step_idx.item()) if isinstance(step_idx, torch.Tensor) else int(step_idx)
                         t = timesteps[step_idx]
-                        # Load on-demand for micro-batch
-                        latents_in = all_latents[step_idx][start:end].to(device)
-                        latents_out = all_latents[step_idx + 1][start:end].to(device)
+                        # Load on-demand for micro-batch (keep float32 for accurate KL)
+                        latents_in = all_latents[step_idx][start:end].to(device=device, dtype=torch.float32)
+                        latents_out = all_latents[step_idx + 1][start:end].to(device=device, dtype=torch.float32)
 
-                        latent_model_input = ref_pipeline.scheduler.scale_model_input(latents_in.to(ref_unet_dtype), t)
-                        noise_pred_ref = ref_unet(
+                        latents_in_ref = latents_in.to(ref_unet_dtype)
+                        if do_classifier_free_guidance and uncond_embeds_ref_full is not None:
+                            latent_model_input = torch.cat([latents_in_ref, latents_in_ref], dim=0)
+                            encoder_hidden_states_ref = torch.cat([
+                                uncond_embeds_ref_full[start:end],
+                                embeds_ref_slice,
+                            ], dim=0)
+                        else:
+                            latent_model_input = latents_in_ref
+                            encoder_hidden_states_ref = embeds_ref_slice
+
+                        latent_model_input = ref_pipeline.scheduler.scale_model_input(latent_model_input, t)
+                        noise_pred_ref_full = ref_unet(
                             latent_model_input,
                             t,
-                            encoder_hidden_states=embeds_ref_slice,
+                            encoder_hidden_states=encoder_hidden_states_ref,
                             return_dict=False,
                         )[0]
+                        if do_classifier_free_guidance:
+                            noise_pred_ref_uncond, noise_pred_ref_text = noise_pred_ref_full.chunk(2)
+                            noise_pred_ref = noise_pred_ref_uncond + guidance_scale * (noise_pred_ref_text - noise_pred_ref_uncond)
+                        else:
+                            noise_pred_ref = noise_pred_ref_full
+                        noise_pred_ref = noise_pred_ref.to(torch.float32)
 
                         timestep_int = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
                         _, log_prob_ref = ddim_step_with_logprob(
@@ -590,7 +740,7 @@ def train_grpo(
                         acc_slice = acc_slice + log_prob_ref.to(torch.float32)
 
                         # Free GPU memory for this micro-batch slice immediately
-                        del latents_in, latents_out, latent_model_input, noise_pred_ref
+                        del latents_in, latents_out, latents_in_ref, latent_model_input, noise_pred_ref, noise_pred_ref_full
                         torch.cuda.empty_cache()
 
                     logp_ref_flat[start:end] = acc_slice
@@ -611,23 +761,24 @@ def train_grpo(
                 loss_policy = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
             else:
                 loss_policy = torch.mean(unclipped_loss)
-            loss_kl = ((logp_sum_new.detach() - logp_ref) ** 2).mean()
             
-            # Add UNet regularization to loss
+            # Compute latent-space KL divergence (flow_grpo style)
+            # Normalized by timestep noise variance for stability across different diffusion steps
+            kl_latent_mean = kl_latent_loss / max(num_kl_steps, 1)
+            loss_kl = kl_latent_mean
+            
+            # Legacy unet_reg support (deprecated, use latent KL instead)
             if config.model.unet_reg_scale > 0:
-                unet_reg_mean = unet_reg_loss / max(num_reg_steps, 1)
-                loss = loss_policy + beta * loss_kl + config.model.unet_reg_scale * unet_reg_mean
-            else:
-                unet_reg_mean = 0.0
-                loss = loss_policy + beta * loss_kl
+                logger.warning("[GRPO] unet_reg_scale is deprecated, latent-space KL is now used automatically")
+            
+            loss = loss_policy + beta * loss_kl
             
             # DEBUG: Print logp values to diagnose KL=0
             if is_local_main_process and batch_idx == 0:
                 logger.info(f"[DEBUG] logp_sum_new: mean={logp_sum_new.mean().item():.4f} std={logp_sum_new.std().item():.4f}")
                 logger.info(f"[DEBUG] logp_ref: mean={logp_ref.mean().item():.4f} std={logp_ref.std().item():.4f}")
                 logger.info(f"[DEBUG] diff: mean={(logp_sum_new - logp_ref).mean().item():.6f} std={(logp_sum_new - logp_ref).std().item():.6f}")
-                if config.model.unet_reg_scale > 0:
-                    logger.info(f"[DEBUG] unet_reg: {unet_reg_mean:.6f}")
+                logger.info(f"[DEBUG] latent_kl: {kl_latent_mean:.6f}")
             
             loss = loss / grad_accum
 
@@ -650,55 +801,58 @@ def train_grpo(
 
             # Compute monitoring metrics
             ratio = torch.exp(delta_logp.detach()).mean().item()
-            kl_div = ((logp_sum_new.detach() - logp_ref) ** 2).mean().item()
+            # Log-prob based KL (for diagnostics only; main regularizer uses latent-space KL)
+            kl_logprob = ((logp_sum_new.detach() - logp_ref) ** 2).mean().item()
             clip_fraction = ((torch.abs(torch.exp(delta_logp.detach()) - 1.0) > clip_range).float().mean().item() if clip_range > 0 else 0.0)
             advantage_mean = advantages.mean().item()
             advantage_std = advantages.std().item()
+            # Compute advantage clipping saturation ratio: fraction of samples with |s*Z| > C
+            advantage_clip_frac = 0.0
+            if adv_clip_max > 0 and advantages_pre_clip is not None:
+                advantage_clip_frac = (torch.abs(advantages_pre_clip) > adv_clip_max).float().mean().item()
             
             # Warning if ratio deviates significantly from 1.0 (on-policy target)
             if is_local_main_process and abs(ratio - 1.0) > 0.02:
                 logger.warning(f"[GRPO] ratio deviates from on-policy: {ratio:.3f}")
             
             # Warning if KL divergence is too high
-            if is_local_main_process and kl_div > 0.3:
-                logger.warning(f"[GRPO] High KL divergence: {kl_div:.4f} (consider increasing beta or reducing reward_scale)")
+            if is_local_main_process and loss_kl > 0.3:
+                logger.warning(f"[GRPO] High latent KL: {loss_kl:.4f} (consider increasing beta or reducing reward_scale)")
 
             if is_local_main_process:
                 log_msg = (
                     f"[GRPO] epoch {epoch} batch {batch_idx}/{num_batches} | "
-                    f"loss={loss_policy.item():.4f} kl={kl_div:.4f}"
+                    f"loss={loss_policy.item():.4f} kl_latent={loss_kl:.4f} kl_logprob={kl_logprob:.4f}"
                 )
-                if config.model.unet_reg_scale > 0:
-                    log_msg += f" ureg={unet_reg_mean:.4f}"
                 log_msg += (
                     f" | reward={reward_mean:.3f}±{reward_std:.3f} adv={advantage_mean:.2e}±{advantage_std:.2e} | "
-                    f"ratio={ratio:.3f} clip_frac={clip_fraction:.3f}"
+                    f"ratio={ratio:.3f} clip_frac={clip_fraction:.3f} adv_clip_frac={advantage_clip_frac:.3f}"
                 )
                 logger.info(log_msg)
                 
                 if config.logging.use_wandb:
-                    # Log metrics at actual training step (only when optimizer.step() is called)
-                    # Note: We log every batch for monitoring, but global_step only increments on actual updates
+                    # Use unique step identifier (epoch*num_batches+batch_idx) to avoid overwriting
+                    # This ensures every batch gets logged with its own step
+                    wandb_step = epoch * num_batches + batch_idx
                     log_dict = {
                         "loss/policy": loss_policy.item(),
-                        "loss/kl": kl_div,
+                        "loss/kl_latent": loss_kl,
                         "loss/total": loss.item() * grad_accum,
                         "reward/mean": reward_mean,
                         "reward/std": reward_std,
                         "advantage/mean": advantage_mean,
                         "advantage/std": advantage_std,
+                        "advantage/clip_frac": advantage_clip_frac,
                         "ratio/mean": ratio,
                         "ratio/clip_fraction": clip_fraction,
-                        "kl/divergence": kl_div,
+                        "kl/logprob_mse": kl_logprob,
                         "epoch": epoch,
                         "batch_idx": batch_idx,
                         "global_step": global_step,
                     }
                     if adv_clip_max > 0:
                         log_dict["advantage/clip_max"] = adv_clip_max
-                    if config.model.unet_reg_scale > 0:
-                        log_dict["loss/unet_reg"] = unet_reg_mean
-                    wandb.log(log_dict, step=global_step)
+                    wandb.log(log_dict, step=wandb_step)
             
             # Save images (optional, last batch of each epoch for visualization)
             if batch_idx == num_batches - 1:  # Last batch of epoch
@@ -720,6 +874,8 @@ def train_grpo(
                     # imgs shape: (batch_size, group_size, 3, H, W)
                     imgs_flat = imgs.view(-1, *imgs.shape[2:])  # (batch*group, 3, H, W)
                     num_imgs_to_log = min(16, imgs_flat.shape[0])
+                    # Use unique step for image logging (epoch-based to avoid conflicts)
+                    image_step = epoch * num_batches + batch_idx
                     with tempfile.TemporaryDirectory() as tmpdir:
                         for i in range(num_imgs_to_log):
                             image_np = imgs_flat[i].cpu().float().numpy()  # (3, H, W)
@@ -727,22 +883,83 @@ def train_grpo(
                             pil = Image.fromarray(image_np)
                             pil = pil.resize((256, 256))
                             pil.save(os.path.join(tmpdir, f"{i}.jpg"))
+                        
+                        # Build caption with prompt and reward
+                        wandb_images = []
+                        for i in range(num_imgs_to_log):
+                            prompt_idx = i // group_size
+                            prompt_text = prompts[prompt_idx] if prompt_idx < len(prompts) else "N/A"
+                            reward_val = rewards_flat[i].item() if i < len(rewards_flat) else 0.0
+                            caption = f"{prompt_text[:50]}... | R={reward_val:.2f}"
+                            wandb_images.append(
+                                wandb.Image(
+                                    os.path.join(tmpdir, f"{i}.jpg"),
+                                    caption=caption
+                                )
+                            )
+                        
                         wandb.log(
-                            {
-                                "sample_images": [
-                                    wandb.Image(
-                                        os.path.join(tmpdir, f"{i}.jpg"),
-                                        caption=f"{prompts[i // group_size] if i < len(prompts) * group_size else 'extra'} | {rewards_flat[i].item():.2f}"
-                                    )
-                                    for i in range(num_imgs_to_log)
-                                ]
-                            },
-                            step=global_step,  # Use actual training step
+                            {"sample_images": wandb_images},
+                            step=image_step,
                         )
             
             # Clear latents dict to free CPU memory for next batch
             all_latents.clear()
             torch.cuda.empty_cache()
+        
+        # Calculate diversity using DreamSim every 5 epochs
+        if dreamsim_model is not None and epoch % 5 == 0:
+            if is_local_main_process:
+                try:
+                    with torch.inference_mode():
+                        # Sample a batch of images for diversity calculation
+                        sample_seed = config.seed + epoch * 999
+                        sample_generator = torch.Generator(device=device).manual_seed(sample_seed)
+                        sample_prompts = [prompt_fn(**config.experiment.prompt_fn_kwargs) for _ in range(min(16, batch_size))]
+                        sample_prompts_text = [p[0] for p in sample_prompts]
+                        
+                        # Generate images using pipeline
+                        output = pipeline(
+                            sample_prompts_text,
+                            num_inference_steps=num_inference_steps,
+                            guidance_scale=config.sampling.guidance_scale,
+                            generator=sample_generator,
+                            output_type="pil",
+                            return_dict=True,
+                        )
+                        sample_imgs_pil = output.images
+                        
+                        # Extract embeddings using DreamSim
+                        embeddings_list = []
+                        for img_pil in sample_imgs_pil:
+                            # Preprocess and extract embedding
+                            img_tensor = dreamsim_preprocess(img_pil).unsqueeze(0).to(device)
+                            embed = dreamsim_model.embed(img_tensor)  # (1, embed_dim) or (1, n_patches, embed_dim)
+                            # Flatten to (embed_dim,)
+                            if len(embed.shape) > 2:
+                                embed = embed.mean(dim=1)  # Average over patches if patch model
+                            embeddings_list.append(embed.squeeze(0))
+                        
+                        # Stack embeddings: (n_samples, embed_dim)
+                        embeddings = torch.stack(embeddings_list)
+                        
+                        # Compute variance across samples (diversity metric)
+                        # Higher variance = higher diversity
+                        diversity_dreamsim = embeddings.var(dim=0).mean().item() * 100  # Scale to match paper units (x10^-2)
+                        
+                        logger.info(f"[Diversity] Epoch {epoch}: DreamSim diversity = {diversity_dreamsim:.2f} (x10^-2)")
+                        
+                        if config.logging.use_wandb:
+                            wandb.log({
+                                "diversity/dreamsim": diversity_dreamsim,
+                                "epoch": epoch,
+                            }, step=global_step)
+                        
+                        del sample_imgs_pil, embeddings_list, embeddings
+                        torch.cuda.empty_cache()
+                        
+                except Exception as e:
+                    logger.warning(f"Failed to compute diversity: {e}")
         
         # Save checkpoint every save_freq epochs (default: 5)
         if epoch % config.logging.save_freq == 0 or epoch == num_epochs - 1:
@@ -769,6 +986,25 @@ def train_grpo(
                     'global_step': global_step,
                     'optimizer_state_dict': optimizer.state_dict(),
                 }, optimizer_path)
+
+                # Save conv_out weights to match non-GRPO repo artifacts
+                try:
+                    conv_out_weights = unwrapped_unet.conv_out.state_dict()
+                    torch.save(
+                        conv_out_weights,
+                        os.path.join(config.saving.output_dir, f"conv_out_weights_epoch{epoch}.pt"),
+                    )
+                except Exception as e:
+                    logger.warning(f"[GRPO] Failed to save conv_out weights: {e}")
+
+                # Create underscore alias for checkpoint directory for compatibility
+                try:
+                    alias_path = os.path.join(config.saving.output_dir, f"checkpoint_epoch_{epoch}")
+                    if not os.path.exists(alias_path):
+                        rel_target = os.path.relpath(save_path, os.path.dirname(alias_path))
+                        os.symlink(rel_target, alias_path)
+                except Exception as e:
+                    logger.warning(f"[GRPO] Failed to create alias 'checkpoint_epoch_{epoch}': {e}")
                 
                 logger.info(f"[GRPO] Saved checkpoint to {save_path}")
             
@@ -838,7 +1074,7 @@ def train():
     is_local_main_process = local_rank == 0
     setup_for_distributed(is_local_main_process)
 
-    config, pipeline, optimizer, unet, res_logflowscore_model, sample_neg_prompt_embeds, train_neg_prompt_embeds, logger, scaler = setup(local_rank, is_local_main_process)
+    config, pipeline, optimizer, unet, res_logflowscore_model, sample_neg_prompt_embeds, train_neg_prompt_embeds, logger, scaler, dreamsim_model, dreamsim_preprocess = setup(local_rank, is_local_main_process)
 
     device = torch.device(local_rank)
 
@@ -859,6 +1095,8 @@ def train():
             scaler,
             device,
             is_local_main_process,
+            dreamsim_model,
+            dreamsim_preprocess,
         )
         return
 

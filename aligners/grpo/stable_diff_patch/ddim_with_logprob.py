@@ -15,6 +15,12 @@ def _left_broadcast(t, shape):
 
 
 def _get_variance(self, timestep, prev_timestep):
+    # Convert int to tensor if needed
+    if isinstance(timestep, int):
+        timestep = torch.tensor([timestep], dtype=torch.long)
+    if isinstance(prev_timestep, int):
+        prev_timestep = torch.tensor([prev_timestep], dtype=torch.long)
+    
     alpha_prod_t = torch.gather(self.alphas_cumprod, 0, timestep.cpu()).to(
         timestep.device
     )
@@ -89,19 +95,17 @@ def ddim_step_with_logprob(
         timestep - self.config.num_train_timesteps // self.num_inference_steps
     )
     # to prevent OOB on gather
-    # Ensure prev_timestep is a tensor before clamping
-    if not isinstance(prev_timestep, torch.Tensor):
-        prev_timestep = torch.tensor(prev_timestep, device=timestep.device if isinstance(timestep, torch.Tensor) else 'cpu')
-    prev_timestep = torch.clamp(prev_timestep, 0, self.config.num_train_timesteps - 1)
+    prev_timestep = max(0, min(prev_timestep, self.config.num_train_timesteps - 1))
+    
+    # Convert to tensors for gather operations
+    timestep_tensor = torch.tensor([timestep], dtype=torch.long)
+    prev_timestep_tensor = torch.tensor([prev_timestep], dtype=torch.long)
 
     # 2. compute alphas, betas
-    # Ensure timestep is a tensor
-    if not isinstance(timestep, torch.Tensor):
-        timestep = torch.tensor(timestep, device=sample.device)
-    alpha_prod_t = self.alphas_cumprod.gather(0, timestep.cpu())
+    alpha_prod_t = self.alphas_cumprod.gather(0, timestep_tensor.cpu())
     alpha_prod_t_prev = torch.where(
-        prev_timestep.cpu() >= 0,
-        self.alphas_cumprod.gather(0, prev_timestep.cpu()),
+        prev_timestep_tensor.cpu() >= 0,
+        self.alphas_cumprod.gather(0, prev_timestep_tensor.cpu()),
         self.final_alpha_cumprod,
     )
     alpha_prod_t = _left_broadcast(alpha_prod_t, sample.shape).to(sample.device)
@@ -146,9 +150,11 @@ def ddim_step_with_logprob(
 
     # 5. compute variance: "sigma_t(η)" -> see formula (16)
     # σ_t = sqrt((1 − α_t−1)/(1 − α_t)) * sqrt(1 − α_t/α_t−1)
-    variance = _get_variance(self, timestep, prev_timestep)
+    # IMPORTANT: Compute variance in float32 for numerical stability of log_prob
+    variance = _get_variance(self, timestep_tensor, prev_timestep_tensor)
+    variance = variance.to(torch.float32)
     std_dev_t = eta * variance ** (0.5)
-    std_dev_t = _left_broadcast(std_dev_t, sample.shape).to(sample.device)
+    std_dev_t = _left_broadcast(std_dev_t, sample.shape).to(torch.float32).to(sample.device)
 
     if use_clipped_model_output:
         # the pred_epsilon is always re-derived from the clipped x_0 in Glide
@@ -165,6 +171,8 @@ def ddim_step_with_logprob(
     prev_sample_mean = (
         alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction
     )
+    # Ensure prev_sample_mean is float32 for log_prob computation
+    prev_sample_mean_fp32 = prev_sample_mean.to(torch.float32)
 
     if prev_sample is not None and generator is not None:
         raise ValueError(
@@ -182,10 +190,12 @@ def ddim_step_with_logprob(
         prev_sample = prev_sample_mean + std_dev_t * variance_noise
 
     # log prob of prev_sample given prev_sample_mean and std_dev_t
+    # IMPORTANT: All log_prob computations in float32 for numerical stability
+    prev_sample_fp32 = prev_sample.detach().to(torch.float32)
     log_prob = (
-        -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * (std_dev_t**2))
+        -((prev_sample_fp32 - prev_sample_mean_fp32) ** 2) / (2 * (std_dev_t**2))
         - torch.log(std_dev_t)
-        - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
+        - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi, dtype=torch.float32)))
     )
     # mean along all but batch dimension
     log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))

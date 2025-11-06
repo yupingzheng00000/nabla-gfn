@@ -20,6 +20,8 @@ def get_default_configs():
     training.mixed_precision = "bf16"
     training.allow_tf32 = True
     training.gradscaler_growth_interval = 2000
+    # Reduce activation memory usage
+    training.gradient_checkpointing = True
 
 
     model = config.model = config_dict.ConfigDict()
@@ -29,7 +31,7 @@ def get_default_configs():
     ### GFN Specific
     model.flow_layers_per_block = 1
     model.flow_channel_width = (64, 128, 256, 256)
-    model.unet_reg_scale = 1e3  # Now also used in GRPO for stability
+    model.unet_reg_scale = 0.0  # DEPRECATED: now using unified latent-space KL regularization (set to 0)
     model.reverse_loss_scale = 1.0
     model.no_flow = False
     model.pretrained_strength = 1.0
@@ -42,7 +44,8 @@ def get_default_configs():
     sampling = config.sampling = config_dict.ConfigDict()
     sampling.num_steps = 50
     sampling.eta = 1
-    sampling.guidance_scale = 5.0
+    # Train with CFG disabled (guidance scale = 1.0) for numerical stability & lower memory
+    sampling.guidance_scale = 1.0
     sampling.batch_size = 16
     sampling.num_batches_per_epoch = 4
     sampling.low_var_subsampling = True
@@ -52,9 +55,13 @@ def get_default_configs():
     grpo = config.grpo = config_dict.ConfigDict()
     grpo.enabled = False
     grpo.group_size = 4
-    grpo.beta = 0.1  # Increased from 0.05 to better constrain KL divergence
+    grpo.beta = 0.02  # Aligned with flow_grpo SD3 baseline (range: 0.004-0.04 depending on task)
     grpo.clip_range = 0.2
     grpo.adv_clip_max = 5.0  # Clamp normalized advantages to stabilise PPO updates (set to 0 to disable)
+    # Micro-batch size for per-timestep UNet recomputation (controls peak memory)
+    grpo.micro_batch_size = 2
+    # Huber loss threshold for KL divergence (DEPRECATED: now using latent-space KL with timestep normalization)
+    grpo.huber_delta = 0.01  # Kept for backward compatibility but unused
 
 
     sample = config.sample = config_dict.ConfigDict()

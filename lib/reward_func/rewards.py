@@ -44,16 +44,16 @@ def aesthetic_score(dtype=torch.float32, device="cuda", distributed=True):
     return _fn
 
 # For ImageReward
-import ImageReward as RM
-from PIL import Image
-from torchvision.transforms import Compose, Resize, CenterCrop, Normalize
-try:
-    from torchvision.transforms import InterpolationMode
-    BICUBIC = InterpolationMode.BICUBIC
-except ImportError:
-    BICUBIC = Image.BICUBIC
-
 def imagereward(dtype=torch.float32, device="cuda"):
+    import ImageReward as RM
+    from PIL import Image
+    from torchvision.transforms import Compose, Resize, CenterCrop, Normalize
+    try:
+        from torchvision.transforms import InterpolationMode
+        BICUBIC = InterpolationMode.BICUBIC
+    except ImportError:
+        BICUBIC = Image.BICUBIC
+    
     # aesthetic = RM.load_score("Aesthetic", device=device)
     if get_local_rank() == 0:  # only download once
         reward_model = RM.load("ImageReward-v1.0")
@@ -156,12 +156,16 @@ def pickscore(dtype=torch.float32, device="cuda", distributed=True):
     processor_path = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
     model_path = "yuvalkirstain/PickScore_v1"
     
-    if distributed:
-        if get_local_rank() == 0:  # only download once
-            processor = CLIPProcessor.from_pretrained(processor_path)
-            model = CLIPModel.from_pretrained(model_path)
-        dist.barrier()
+    # Download models sequentially to avoid race conditions
+    if distributed and get_local_rank() == 0:
+        # Only rank 0 downloads first
+        processor = CLIPProcessor.from_pretrained(processor_path)
+        model = CLIPModel.from_pretrained(model_path)
     
+    if distributed:
+        dist.barrier()  # Wait for rank 0 to finish downloading
+    
+    # All ranks load the cached models
     processor = CLIPProcessor.from_pretrained(processor_path)
     model = CLIPModel.from_pretrained(model_path)
     model = model.eval().to(device).to(dtype)
