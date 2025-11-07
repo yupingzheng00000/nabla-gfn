@@ -16,14 +16,22 @@ import pickle, gzip
 import math
 
 import diffusers
-from diffusers import DDIMScheduler, StableDiffusionPipeline, UNet2DConditionModel, DPMSolverSinglestepScheduler
+from diffusers import (
+    DDIMScheduler,
+    StableDiffusionPipeline,
+    StableDiffusion3Pipeline,
+    UNet2DConditionModel,
+    DPMSolverSinglestepScheduler,
+    FlowMatchEulerDiscreteScheduler,
+    AutoencoderTiny,
+)
 from diffusers.training_utils import cast_training_params
 from diffusers.utils import convert_state_dict_to_diffusers
 from diffusers.utils.torch_utils import is_compiled_module
 from diffusers.utils.import_utils import is_xformers_available
 
 from packaging import version
-from peft import LoraConfig
+from peft import LoraConfig, get_peft_model
 from peft.utils import get_peft_model_state_dict
 
 import numpy as np
@@ -36,10 +44,21 @@ import lib.reward_func.prompts
 import lib.reward_func.rewards
 from lib.diffusion.sample_trajectory import sample_trajectory
 from lib.diffusion.inference_step import inference_step, predict_clean, get_alpha_prod_t
-from aligners.grpo.sd15_pipeline_with_logprob_fast import sample_group_with_sde_window
-from aligners.grpo.sd15_sde_with_logprob import sde_step_with_logprob
+from aligners.grpo.sd15_pipeline_with_logprob_fast import (
+    sample_group_with_sde_window as sample_group_with_sde_window_sd15,
+)
+from aligners.grpo.sd15_sde_with_logprob import sde_step_with_logprob as sde_step_with_logprob_sd15
+from aligners.grpo.sample_trajectory_sd3 import (
+    sample_group_with_sde_window as sample_group_with_sde_window_sd3,
+)
+from aligners.grpo.sd3_sde_with_logprob import (
+    sde_step_with_logprob as sde_step_with_logprob_sd3,
+)
 from aligners.grpo.sd15_pipeline_with_logprob_slow import pipeline_with_logprob_slow
 from aligners.grpo.ddim_grpo_sampler import sample_group_ddim, ddim_step_with_logprob
+from third_party.flow_grpo.flow_grpo.diffusers_patch.train_dreambooth_lora_sd3 import (
+    encode_prompt as encode_prompt_sd3,
+)
 
 # DreamSim for diversity calculation
 try:
@@ -71,6 +90,37 @@ def unwrap_model(model):
     return model
 
 
+@contextlib.contextmanager
+def temporarily_disable_lora(module):
+    """Context manager to disable LoRA adapters for diffusers or PEFT models.
+
+    Supports:
+    - diffusers built-in LoRA (disable_adapters/enable_adapters)
+    - PEFT LoRA (disable_adapter context manager)
+    - DDP-wrapped variants (via .module)
+    """
+    # diffusers LoRA
+    if hasattr(module, "disable_adapters") and hasattr(module, "enable_adapters"):
+        module.disable_adapters()
+        try:
+            yield
+        finally:
+            module.enable_adapters()
+        return
+    # PEFT LoRA on the module itself
+    if hasattr(module, "disable_adapter"):
+        with module.disable_adapter():
+            yield
+        return
+    # PEFT LoRA on underlying .module
+    if hasattr(module, "module") and hasattr(module.module, "disable_adapter"):
+        with module.module.disable_adapter():
+            yield
+        return
+    # No-op fallback
+    yield
+
+
 def main(args):
     train()
 
@@ -82,6 +132,15 @@ def setup(local_rank, is_local_main_process):
     )
     logger = logging.getLogger(__name__)
     config = FLAGS.config
+
+    if not hasattr(config, "model"):
+        config.model = type("cfg", (), {})()
+    use_sd3 = bool(getattr(config.model, "use_sd3", False))
+    if not use_sd3:
+        pretrained_name = getattr(config.pretrained, "model", "")
+        lowered = pretrained_name.lower()
+        use_sd3 = "stable-diffusion-3" in lowered or "sd3" in lowered
+    config.model.use_sd3 = use_sd3
 
     config.gpu_type = torch.cuda.get_device_name() \
                             if torch.cuda.is_available() else "CPU"
@@ -130,35 +189,57 @@ def setup(local_rank, is_local_main_process):
         weight_dtype = torch.bfloat16
     device = torch.device(local_rank)
 
-    pipeline = StableDiffusionPipeline.from_pretrained(
-        config.pretrained.model, revision=config.pretrained.revision, torch_dtype=weight_dtype,
-    )
     scheduler_config = {}
-
-    scheduler_config.update(pipeline.scheduler.config)
     num_inference_steps = config.sampling.num_steps
-    if FLAGS.mode == "grpo":
-        if is_local_main_process:
-            logger.info("GRPO mode: using DDIMScheduler with eta=1.0 (DDPM-equivalent)")
-        pipeline.scheduler = DDIMScheduler.from_config(scheduler_config)
-        # Note: config.sampling.eta is already 1 in default_config.py (int type)
-        # DDIM with eta=1 is equivalent to DDPM (full stochastic)
+
+    if use_sd3:
+        pipeline = StableDiffusion3Pipeline.from_pretrained(
+            config.pretrained.model,
+            revision=getattr(config.pretrained, "revision", None),
+            torch_dtype=weight_dtype,
+        )
+        scheduler_config.update(pipeline.scheduler.config)
+        pipeline.scheduler = FlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
         pipeline.scheduler.set_timesteps(num_inference_steps, device=device)
-    elif config.sampling.scheduler == 'DPM-solver':
-        if is_local_main_process:
-            logger.info("Using SDE DPM-solver (1st order)")
-        pipeline.scheduler = DPMSolverSinglestepScheduler.from_config(scheduler_config)
-        pipeline.scheduler.config.algorithm_type = "sde-dpmsolver++"  # Switch to SDE mode
-        pipeline.scheduler.config.final_sigmas_type = 'sigma_min'
-        pipeline.scheduler.set_timesteps(num_inference_steps, device=device)
+        pipeline.sample_group_with_sde_window = sample_group_with_sde_window_sd3.__get__(pipeline, type(pipeline))
+        pipeline.pipeline_with_logprob_slow = pipeline.sample_group_with_sde_window
+
+        if getattr(config.pretrained, "autoencodertiny", False):
+            pipeline.vae = AutoencoderTiny.from_pretrained("madebyollin/taesd3", torch_dtype=torch.float32)
+        pipeline.vae.requires_grad_(False)
+        pipeline.vae.to(device, dtype=torch.float32)
+
+        for enc in [pipeline.text_encoder, pipeline.text_encoder_2, pipeline.text_encoder_3]:
+            enc.requires_grad_(False)
+            enc.to(device, dtype=weight_dtype)
     else:
-        pipeline.scheduler = DDIMScheduler.from_config(scheduler_config)
-    pipeline.sample_group_with_sde_window = sample_group_with_sde_window.__get__(pipeline, type(pipeline))
-    pipeline.vae.requires_grad_(False)
-    pipeline.text_encoder.requires_grad_(False)
-    pipeline.vae.to(device, dtype=weight_dtype)
-    pipeline.text_encoder.to(device, dtype=weight_dtype)
-    pipeline.scheduler.set_timesteps(config.sampling.num_steps, device=device)  # set_timesteps(): 1000 steps -> 50 steps
+        pipeline = StableDiffusionPipeline.from_pretrained(
+            config.pretrained.model,
+            revision=config.pretrained.revision,
+            torch_dtype=weight_dtype,
+        )
+        scheduler_config.update(pipeline.scheduler.config)
+        if FLAGS.mode == "grpo":
+            if is_local_main_process:
+                logger.info("GRPO mode: using DDIMScheduler with eta=1.0 (DDPM-equivalent)")
+            pipeline.scheduler = DDIMScheduler.from_config(scheduler_config)
+            pipeline.scheduler.set_timesteps(num_inference_steps, device=device)
+        elif config.sampling.scheduler == 'DPM-solver':
+            if is_local_main_process:
+                logger.info("Using SDE DPM-solver (1st order)")
+            pipeline.scheduler = DPMSolverSinglestepScheduler.from_config(scheduler_config)
+            pipeline.scheduler.config.algorithm_type = "sde-dpmsolver++"
+            pipeline.scheduler.config.final_sigmas_type = 'sigma_min'
+            pipeline.scheduler.set_timesteps(num_inference_steps, device=device)
+        else:
+            pipeline.scheduler = DDIMScheduler.from_config(scheduler_config)
+            pipeline.scheduler.set_timesteps(num_inference_steps, device=device)
+        pipeline.sample_group_with_sde_window = sample_group_with_sde_window_sd15.__get__(pipeline, type(pipeline))
+        pipeline.pipeline_with_logprob_slow = pipeline_with_logprob_slow.__get__(pipeline, type(pipeline))
+        pipeline.vae.requires_grad_(False)
+        pipeline.text_encoder.requires_grad_(False)
+        pipeline.vae.to(device, dtype=weight_dtype)
+        pipeline.text_encoder.to(device, dtype=weight_dtype)
 
     pipeline.safety_checker = None
     # Save memory during VAE encode/decode
@@ -174,17 +255,45 @@ def setup(local_rank, is_local_main_process):
         dynamic_ncols=True,
     )
 
-    unet = pipeline.unet
-    unet.requires_grad_(False)
-    for name, param in unet.named_parameters():
+    policy_module = pipeline.transformer if use_sd3 else pipeline.unet
+    policy_module.requires_grad_(False)
+    for _, param in policy_module.named_parameters():
         param.requires_grad_(False)
-    unet.to(device, dtype=weight_dtype)
+
+    if use_sd3:
+        target_modules = [
+            "attn.add_k_proj",
+            "attn.add_q_proj",
+            "attn.add_v_proj",
+            "attn.to_add_out",
+            "attn.to_k",
+            "attn.to_out.0",
+            "attn.to_q",
+            "attn.to_v",
+        ]
+    else:
+        target_modules = ["to_k", "to_q", "to_v", "to_out.0"]
+
     unet_lora_config = LoraConfig(
-        r=config.model.lora_rank, lora_alpha=config.model.lora_rank,
+        r=config.model.lora_rank,
+        lora_alpha=config.model.lora_rank,
         init_lora_weights="gaussian",
-        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+        target_modules=target_modules,
     )
-    unet.add_adapter(unet_lora_config, adapter_name="pf") ## LoRA
+
+    try:
+        policy_module.add_adapter(unet_lora_config, adapter_name="pf")
+    except AttributeError:
+        policy_module = get_peft_model(policy_module, unet_lora_config, adapter_name="pf")
+
+    if use_sd3:
+        pipeline.transformer = policy_module
+        pipeline.unet = policy_module
+    else:
+        pipeline.unet = policy_module
+
+    unet = policy_module
+    unet.to(device, dtype=weight_dtype)
 
     # Enable gradient checkpointing to reduce activation memory
     if getattr(config.training, "gradient_checkpointing", True):
@@ -326,6 +435,23 @@ def train_grpo(
     dreamsim_model=None,
     dreamsim_preprocess=None,
 ):
+    use_sd3 = bool(getattr(config.model, "use_sd3", False))
+    if use_sd3:
+        return train_grpo_sd3(
+            local_rank,
+            global_rank,
+            world_size,
+            config,
+            pipeline,
+            optimizer,
+            unet,
+            logger,
+            scaler,
+            device,
+            is_local_main_process,
+            dreamsim_model,
+            dreamsim_preprocess,
+        )
     pipeline.unet.eval()
     unet.train()
 
@@ -1009,6 +1135,463 @@ def train_grpo(
                 logger.info(f"[GRPO] Saved checkpoint to {save_path}")
             
             dist.barrier()
+
+
+def train_grpo_sd3(
+    local_rank,
+    global_rank,
+    world_size,
+    config,
+    pipeline,
+    optimizer,
+    unet,
+    logger,
+    scaler,
+    device,
+    is_local_main_process,
+    dreamsim_model=None,
+    dreamsim_preprocess=None,
+):
+    pipeline.unet.eval()
+    unet.train()
+
+    prompt_fn = getattr(lib.reward_func.prompts, config.experiment.prompt_fn)
+    reward_ctor = getattr(lib.reward_func.rewards, config.experiment.reward_fn)
+    reward_fn = reward_ctor(torch.float32, device)
+
+    group_size = int(config.grpo.group_size)
+    clip_range = float(config.grpo.clip_range)
+    adv_clip_max = float(getattr(config.grpo, "adv_clip_max", 0.0) or 0.0)
+    beta = float(config.grpo.beta)
+    grad_accum = max(1, int(config.training.gradient_accumulation_steps))
+    batch_size = int(config.sampling.batch_size)
+    num_batches = int(config.sampling.num_batches_per_epoch)
+    num_epochs = int(config.training.num_epochs)
+    num_inference_steps = int(config.sampling.num_steps)
+    noise_level = float(getattr(config.sample, "sde_noise_level", 0.8))
+    window_size = int(getattr(config.sample, "sde_window_size", 0))
+    window_range_cfg = getattr(config.sample, "sde_window_range", (0.0, 1.0))
+    window_range = (float(window_range_cfg[0]), float(window_range_cfg[1]))
+    same_latent_flag = bool(getattr(config.sample, "same_latent", True))
+    sde_type = getattr(config.sample, "sde_type", "sde")
+
+    reward_scale = float(config.model.reward_scale)
+
+    if is_local_main_process:
+        logger.info("=" * 70)
+        logger.info("[GRPO][SD3] Configuration:")
+        logger.info(f"  Sampler: FlowMatch Euler (noise_level={noise_level:.2f}, window_size={window_size})")
+        logger.info(f"  Window range: {window_range}")
+        logger.info(f"  Inference steps: {num_inference_steps}")
+        logger.info(f"  Reward function: {config.experiment.reward_fn}")
+        logger.info(f"  Reward scale: {reward_scale:.2e}")
+        logger.info(f"  KL beta: {beta}")
+        logger.info(f"  PPO clip range: {clip_range}")
+        if adv_clip_max > 0:
+            logger.info(f"  Advantage clip max: {adv_clip_max}")
+        else:
+            logger.info("  Advantage clip max: disabled")
+        logger.info(f"  Group size: {group_size}")
+        logger.info(f"  Batch size: {batch_size}")
+        logger.info(f"  Gradient accumulation: {grad_accum}")
+        logger.info(f"  Grad checkpointing: {getattr(config.training, 'gradient_checkpointing', True)}")
+        logger.info(f"  Micro-batch size: {getattr(config.grpo, 'micro_batch_size', 4)}")
+        logger.info("=" * 70)
+
+    unet_module = unet.module if hasattr(unet, "module") else unet
+    unet_dtype = next(unet_module.parameters()).dtype
+
+    amp_dtype = None
+    if config.training.mixed_precision == "fp16":
+        amp_dtype = torch.float16
+    elif config.training.mixed_precision == "bf16":
+        amp_dtype = torch.bfloat16
+    autocast_ctx = torch.cuda.amp.autocast if amp_dtype is not None else contextlib.nullcontext
+    autocast_kwargs = {"dtype": amp_dtype} if amp_dtype is not None else {}
+
+    generator = torch.Generator(device=device)
+    optimizer.zero_grad(set_to_none=True)
+
+    global_step = 0
+    for epoch in range(num_epochs):
+        if is_local_main_process:
+            logger.info(f"[GRPO][SD3] Epoch {epoch}")
+
+        for batch_idx in range(num_batches):
+            seed = config.seed + epoch * num_batches + batch_idx + global_rank
+            generator.manual_seed(seed)
+
+            prompt_batch = [prompt_fn(**config.experiment.prompt_fn_kwargs) for _ in range(batch_size)]
+            prompts, prompt_metadata = zip(*prompt_batch)
+            prompts = list(prompts)
+            prompt_metadata = list(prompt_metadata)
+
+            guidance_scale = float(config.sampling.guidance_scale)
+            if guidance_scale > 1.0 + 1e-6 and noise_level > 0.0:
+                raise ValueError("Flow-GRPO SD3 mode requires guidance_scale <= 1.0 when noise_level > 0.")
+
+            with torch.inference_mode():
+                imgs, log_probs_per_step, timesteps_window, log_probs_sum_old, window_state = (
+                    pipeline.sample_group_with_sde_window(
+                        prompts,
+                        group_size,
+                        window_size,
+                        tuple(window_range),
+                        num_inference_steps=num_inference_steps,
+                        guidance_scale=guidance_scale,
+                        generator=generator,
+                        same_latent=same_latent_flag,
+                        noise_level=noise_level,
+                    )
+                )
+
+            imgs = imgs.to(device=device, dtype=torch.float32)
+            log_probs_per_step = log_probs_per_step.to(device=device, dtype=torch.float32)
+            log_probs_sum_old_subset = log_probs_sum_old.to(device=device, dtype=torch.float32)
+
+            window_inputs = window_state["inputs"].to(device=device, dtype=torch.float32).contiguous()
+            window_outputs = window_state["outputs"].to(device=device, dtype=torch.float32).contiguous()
+            window_steps = window_inputs.shape[0]
+            if window_steps == 0:
+                logger.warning("[GRPO][SD3] Empty SDE window; skipping batch.")
+                continue
+
+            num_branches = batch_size * group_size
+            images_flat = imgs.view(num_branches, *imgs.shape[2:])
+            prompt_repeat = [prompt for prompt in prompts for _ in range(group_size)]
+            metadata_repeat = [meta for meta in prompt_metadata for _ in range(group_size)]
+            rewards_flat, _ = reward_fn(images_flat, prompt_repeat, metadata_repeat)
+            rewards = rewards_flat.to(device=device, dtype=torch.float32).view(batch_size, group_size)
+            reward_mean = rewards.mean().item()
+            reward_std = rewards.std(unbiased=False).item()
+
+            advantages = rewards - rewards.mean(dim=1, keepdim=True)
+            advantages = advantages / (rewards.std(dim=1, keepdim=True) + 1e-6)
+            advantages = advantages * reward_scale
+            advantages_pre_clip = advantages.clone() if adv_clip_max > 0 else None
+            if adv_clip_max > 0:
+                advantages = advantages.clamp_(-adv_clip_max, adv_clip_max)
+
+            text_encoders = [pipeline.text_encoder, pipeline.text_encoder_2, pipeline.text_encoder_3]
+            tokenizers = [pipeline.tokenizer, pipeline.tokenizer_2, pipeline.tokenizer_3]
+            prompt_embeds, pooled_prompt_embeds = encode_prompt_sd3(
+                text_encoders=text_encoders,
+                tokenizers=tokenizers,
+                prompt=prompts,
+                max_sequence_length=getattr(pipeline.tokenizer_3, "model_max_length", 256),
+                device=device,
+                num_images_per_prompt=group_size,
+            )
+            prompt_embeds = prompt_embeds.to(device=device)
+            pooled_prompt_embeds = pooled_prompt_embeds.to(device=device)
+            prompt_embeds_model_full = prompt_embeds.to(unet_dtype)
+            pooled_prompt_embeds_model_full = pooled_prompt_embeds.to(unet_dtype)
+
+            timestep_tensor = torch.as_tensor(
+                timesteps_window,
+                device=device,
+                dtype=pipeline.scheduler.timesteps.dtype if hasattr(pipeline.scheduler, "timesteps") else torch.float32,
+            )
+
+            latent_shape = window_inputs.shape[-3:]
+            window_inputs = window_inputs.view(window_steps, num_branches, *latent_shape)
+            window_outputs = window_outputs.view(window_steps, num_branches, *latent_shape)
+            all_latents = {0: window_inputs[0]}
+            for step_idx in range(window_steps):
+                all_latents[step_idx + 1] = window_outputs[step_idx]
+
+            total = num_branches
+            micro_bs_cfg = int(getattr(config.grpo, "micro_batch_size", 4) or 4)
+            micro_bs = max(1, min(total, micro_bs_cfg))
+
+            logp_sum_new_flat = torch.zeros(total, device=device, dtype=torch.float32)
+            logp_ref_flat = torch.zeros(total, device=device, dtype=torch.float32)
+            kl_latent_loss = 0.0
+            num_kl_steps = 0
+
+            with (autocast_ctx(**autocast_kwargs) if autocast_kwargs else autocast_ctx()):
+                for start in range(0, total, micro_bs):
+                    end = min(start + micro_bs, total)
+                    embeds_slice = prompt_embeds_model_full[start:end]
+                    pooled_slice = pooled_prompt_embeds_model_full[start:end]
+
+                    for local_idx in range(window_steps):
+                        t_value = timestep_tensor[local_idx]
+                        t_scalar = t_value.item() if isinstance(t_value, torch.Tensor) else float(t_value)
+                        t_batch = torch.full((end - start,), t_scalar, device=device, dtype=embeds_slice.dtype)
+                        t_batch_fp32 = t_batch.to(torch.float32)
+
+                        latents_in = all_latents[local_idx][start:end].to(device=device, dtype=torch.float32)
+                        latents_out = all_latents[local_idx + 1][start:end].to(device=device, dtype=torch.float32)
+
+                        latents_in_unet = latents_in.to(unet_dtype)
+                        noise_pred = unet(
+                            hidden_states=latents_in_unet,
+                            timestep=t_batch,
+                            encoder_hidden_states=embeds_slice,
+                            pooled_projections=pooled_slice,
+                            return_dict=False,
+                        )[0]
+                        noise_pred_policy = noise_pred.to(torch.float32)
+
+                        _, log_prob_step, prev_mean_policy, std_dev = sde_step_with_logprob_sd3(
+                            pipeline.scheduler,
+                            noise_pred_policy,
+                            t_batch_fp32,
+                            latents_in,
+                            prev_sample=latents_out,
+                            noise_level=noise_level,
+                            sde_type=sde_type,
+                        )
+                        logp_sum_new_flat[start:end] += log_prob_step
+
+                        with temporarily_disable_lora(unet_module):
+                            noise_pred_ref = unet(
+                                hidden_states=latents_in_unet,
+                                timestep=t_batch,
+                                encoder_hidden_states=embeds_slice,
+                                pooled_projections=pooled_slice,
+                                return_dict=False,
+                            )[0]
+                        noise_pred_ref = noise_pred_ref.to(torch.float32)
+                        _, log_prob_ref_step, prev_mean_ref, _ = sde_step_with_logprob_sd3(
+                            pipeline.scheduler,
+                            noise_pred_ref,
+                            t_batch_fp32,
+                            latents_in,
+                            prev_sample=latents_out,
+                            noise_level=noise_level,
+                            sde_type=sde_type,
+                        )
+                        logp_ref_flat[start:end] += log_prob_ref_step
+
+                        kl_term = ((prev_mean_policy - prev_mean_ref) ** 2) / (2 * torch.clamp(std_dev**2, min=1e-12))
+                        kl_latent_loss += kl_term.mean()
+                        num_kl_steps += 1
+
+            logp_sum_new = logp_sum_new_flat.view(batch_size, group_size)
+            logp_ref = logp_ref_flat.view(batch_size, group_size)
+
+            delta_logp = logp_sum_new - log_probs_sum_old_subset
+            ratio_tensor = torch.exp(delta_logp)
+            unclipped_loss = -advantages * ratio_tensor
+            if clip_range > 0.0:
+                clipped_ratio = torch.clamp(ratio_tensor, 1.0 - clip_range, 1.0 + clip_range)
+                clipped_loss = -advantages * clipped_ratio
+                loss_policy = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
+            else:
+                loss_policy = torch.mean(unclipped_loss)
+
+            kl_latent_mean = kl_latent_loss / max(num_kl_steps, 1)
+            loss_kl = kl_latent_mean
+
+            loss = loss_policy + beta * loss_kl
+            loss = loss / grad_accum
+
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+            if (batch_idx + 1) % grad_accum == 0:
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(unet.parameters(), config.training.max_grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(unet.parameters(), config.training.max_grad_norm)
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+
+            ratio = torch.exp(delta_logp.detach()).mean().item()
+            kl_logprob = ((logp_sum_new.detach() - logp_ref) ** 2).mean().item()
+            clip_fraction = (
+                (torch.abs(ratio_tensor.detach() - 1.0) > clip_range).float().mean().item()
+                if clip_range > 0.0
+                else 0.0
+            )
+            advantage_mean = advantages.mean().item()
+            advantage_std = advantages.std().item()
+            advantage_clip_frac = (
+                (torch.abs(advantages_pre_clip) > adv_clip_max).float().mean().item()
+                if adv_clip_max > 0 and advantages_pre_clip is not None
+                else 0.0
+            )
+
+            if is_local_main_process and abs(ratio - 1.0) > 0.02:
+                logger.warning(f"[GRPO][SD3] ratio deviates from on-policy: {ratio:.3f}")
+
+            if is_local_main_process and loss_kl > 0.3:
+                logger.warning(f"[GRPO][SD3] High latent KL: {loss_kl:.4f} (consider adjusting beta or reward scale)")
+
+            if is_local_main_process:
+                log_msg = (
+                    f"[GRPO][SD3] epoch {epoch} batch {batch_idx}/{num_batches} | "
+                    f"loss={loss_policy.item():.4f} kl_latent={loss_kl:.4f} kl_logprob={kl_logprob:.4f}"
+                )
+                log_msg += (
+                    f" | reward={reward_mean:.3f}±{reward_std:.3f} adv={advantage_mean:.2e}±{advantage_std:.2e} | "
+                    f"ratio={ratio:.3f} clip_frac={clip_fraction:.3f} adv_clip_frac={advantage_clip_frac:.3f}"
+                )
+                logger.info(log_msg)
+
+                if config.logging.use_wandb:
+                    wandb_step = epoch * num_batches + batch_idx
+                    log_dict = {
+                        "loss/policy": loss_policy.item(),
+                        "loss/kl_latent": loss_kl,
+                        "loss/total": loss.item() * grad_accum,
+                        "reward/mean": reward_mean,
+                        "reward/std": reward_std,
+                        "advantage/mean": advantage_mean,
+                        "advantage/std": advantage_std,
+                        "advantage/clip_frac": advantage_clip_frac,
+                        "ratio/mean": ratio,
+                        "ratio/clip_fraction": clip_fraction,
+                        "kl/logprob_mse": kl_logprob,
+                        "epoch": epoch,
+                        "batch_idx": batch_idx,
+                        "global_step": global_step,
+                    }
+                    if adv_clip_max > 0:
+                        log_dict["advantage/clip_max"] = adv_clip_max
+                    wandb.log(log_dict, step=wandb_step)
+
+            if batch_idx == num_batches - 1:
+                if is_local_main_process and (epoch % 5 == 0 or epoch == 0):
+                    images_dir = os.path.join(config.saving.output_dir, f"images_epoch{epoch}")
+                    os.makedirs(images_dir, exist_ok=True)
+                    imgs_flat = imgs.view(-1, *imgs.shape[2:])
+                    for i in range(min(16, imgs_flat.shape[0])):
+                        image_np = imgs_flat[i].cpu().float().numpy()
+                        image_np = (image_np.transpose(1, 2, 0) * 255).astype(np.uint8)
+                        pil = Image.fromarray(image_np)
+                        pil = pil.resize((256, 256))
+                        pil.save(os.path.join(images_dir, f"{i}.jpg"))
+
+                if config.logging.use_wandb and is_local_main_process and (epoch % 5 == 0 or epoch == 0):
+                    import tempfile
+
+                    imgs_flat = imgs.view(-1, *imgs.shape[2:])
+                    num_imgs_to_log = min(16, imgs_flat.shape[0])
+                    image_step = epoch * num_batches + batch_idx
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        for i in range(num_imgs_to_log):
+                            image_np = imgs_flat[i].cpu().float().numpy()
+                            image_np = (image_np.transpose(1, 2, 0) * 255).astype(np.uint8)
+                            pil = Image.fromarray(image_np)
+                            pil = pil.resize((256, 256))
+                            pil.save(os.path.join(tmpdir, f"{i}.jpg"))
+
+                        wandb_images = []
+                        for i in range(num_imgs_to_log):
+                            prompt_idx = i // group_size
+                            prompt_text = prompts[prompt_idx] if prompt_idx < len(prompts) else "N/A"
+                            reward_val = rewards_flat[i].item() if i < len(rewards_flat) else 0.0
+                            caption = f"{prompt_text[:50]}... | R={reward_val:.2f}"
+                            wandb_images.append(
+                                wandb.Image(
+                                    os.path.join(tmpdir, f"{i}.jpg"),
+                                    caption=caption,
+                                )
+                            )
+
+                        wandb.log(
+                            {"sample_images": wandb_images},
+                            step=image_step,
+                        )
+
+        if dreamsim_model is not None and dreamsim_preprocess is not None:
+            try:
+                if is_local_main_process:
+                    with torch.no_grad():
+                        imgs_eval = imgs.view(-1, *imgs.shape[2:])[:32]
+                        pil_images = [
+                            Image.fromarray(
+                                (img.cpu().float().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+                            )
+                            for img in imgs_eval
+                        ]
+                        embeddings_list = []
+                        for pil in pil_images:
+                            tensor_img = dreamsim_preprocess(pil).unsqueeze(0).to(device)
+                            embeddings = dreamsim_model(tensor_img)
+                            embeddings_list.append(embeddings)
+                        embeddings = torch.cat(embeddings_list, dim=0)
+                        diversity_dreamsim = torch.pdist(embeddings, p=2).mean().item()
+                        logger.info(f"[Diversity][SD3] Epoch {epoch}: DreamSim diversity = {diversity_dreamsim:.2f} (x10^-2)")
+                        if config.logging.use_wandb:
+                            wandb.log(
+                                {
+                                    "diversity/dreamsim": diversity_dreamsim,
+                                    "epoch": epoch,
+                                },
+                                step=global_step,
+                            )
+                        del pil_images, embeddings_list, embeddings
+                        torch.cuda.empty_cache()
+            except Exception as e:
+                logger.warning(f"[SD3] Failed to compute diversity: {e}")
+
+        if epoch % config.logging.save_freq == 0 or epoch == num_epochs - 1:
+            if is_local_main_process:
+                save_path = os.path.join(config.saving.output_dir, f"checkpoint_epoch{epoch}")
+                os.makedirs(save_path, exist_ok=True)
+
+                unwrapped_unet = unwrap_model(unet)
+                unet_lora_state_dict = convert_state_dict_to_diffusers(
+                    get_peft_model_state_dict(unwrapped_unet, adapter_name="pf")
+                )
+                # SD3: save transformer LoRA layers to keep naming consistent with downstream eval
+                try:
+                    StableDiffusion3Pipeline.save_lora_weights(
+                        save_directory=save_path,
+                        transformer_lora_layers=unet_lora_state_dict,
+                        is_main_process=is_local_main_process,
+                        safe_serialization=True,
+                    )
+                except Exception:
+                    # Fallback to generic API (older diffusers) if SD3-specific arg isn't available
+                    StableDiffusionPipeline.save_lora_weights(
+                        save_directory=save_path,
+                        unet_lora_layers=unet_lora_state_dict,
+                        is_main_process=is_local_main_process,
+                        safe_serialization=True,
+                    )
+
+                optimizer_path = os.path.join(save_path, "optimizer.pt")
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        "optimizer_state_dict": optimizer.state_dict(),
+                    },
+                    optimizer_path,
+                )
+
+                try:
+                    conv_out_weights = unwrapped_unet.conv_out.state_dict()
+                    torch.save(
+                        conv_out_weights,
+                        os.path.join(config.saving.output_dir, f"conv_out_weights_epoch{epoch}.pt"),
+                    )
+                except Exception as e:
+                    logger.warning(f"[SD3][GRPO] Failed to save conv_out weights: {e}")
+
+                try:
+                    alias_path = os.path.join(config.saving.output_dir, f"checkpoint_epoch_{epoch}")
+                    if not os.path.exists(alias_path):
+                        rel_target = os.path.relpath(save_path, os.path.dirname(alias_path))
+                        os.symlink(rel_target, alias_path)
+                except Exception as e:
+                    logger.warning(f"[SD3][GRPO] Failed to create alias 'checkpoint_epoch_{epoch}': {e}")
+
+                logger.info(f"[GRPO][SD3] Saved checkpoint to {save_path}")
+
+        dist.barrier()
+
 
 def run_sde_sanity(config, pipeline, device, logger):
     prompt_fn = getattr(lib.reward_func.prompts, config.experiment.prompt_fn)
